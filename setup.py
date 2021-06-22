@@ -102,10 +102,7 @@ def command_exists(cmd):
 
 
 def op_enabled(op_name):
-    assert hasattr(ALL_OPS[op_name], 'BUILD_VAR'), \
-        f"{op_name} is missing BUILD_VAR field"
-    env_var = ALL_OPS[op_name].BUILD_VAR
-    return int(os.environ.get(env_var, BUILD_OP_DEFAULT))
+    return 0
 
 
 install_ops = dict.fromkeys(ALL_OPS.keys(), False)
