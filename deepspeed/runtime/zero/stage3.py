@@ -455,9 +455,9 @@ class PartitionedParameterCoordinator(object):
 
         for _, param in sub_module.named_parameters(recurse=False):
             param.ds_status = ZeroParamStatus.AVAILABLE
-            print_rank_0(
-                f"Param {debug_param2name_id_shape_device(param)} norm={param.norm()}",
-                force=False)
+            # print_rank_0(
+            #     f"Param {debug_param2name_id_shape_device(param)} norm={param.norm()}",
+            #     force=False)
         #print_rank_0(f"After fetching (id, shape, device): {[(param.ds_id, param.shape, param.device) for param in sub_module.named_parameters(recurse=False)]}")
 
     @instrument_w_nvtx
