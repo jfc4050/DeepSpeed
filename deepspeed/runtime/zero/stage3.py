@@ -3,16 +3,18 @@
 Licensed under the MIT license.
 """
 
-import sys
+import functools
 import os
-from collections import defaultdict, OrderedDict
+import collections
+from collections import OrderedDict, UserDict
 import itertools
+from typing import Iterable, List, Set
 import torch
 from torch.distributed.distributed_c10d import _get_global_rank
+from torch.nn import Module, Parameter
 import torch.distributed as dist
 import math
 from torch._six import inf
-from torch.autograd import Variable
 
 from deepspeed.utils.logging import logger
 from deepspeed.runtime.fp16.loss_scaler import LossScaler, DynamicLossScaler
@@ -32,22 +34,26 @@ from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedO
 pg_correctness_test = False
 
 FWD_MODULE_STACK = list()
-from deepspeed.utils.debug import debug_module2name_id, debug_param2name_id_numel, debug_param2name_id_shape_device, debug_module2name_class, printflock, log_rank_file
 
 
 def print_rank_0(message, debug=False, force=False):
-    rank = torch.distributed.get_rank()
-    if rank == 0 and (debug or force):
+    if torch.distributed.get_rank() == 0 and (debug or force):
+        logger.info(message)
+
+def info_rank_0(message: str) -> None:
+    if dist.get_rank() == 0:
         print(message)
-    # other variations
-    # - print for all ranks w/o interleaving
-    # printflock(f"[{rank}] {message}")
-    # - print to log file per rank
-    # log_rank_file(rank, message)
 
 def warn_rank_0(message: str) -> None:
     if torch.distributed.get_rank() == 0:
         logger.warn(message)
+
+def get_cuda_mem_allocated_str() -> str:
+    # this is really slow. when enabled the python process becomes slow
+    # to the point where it can't keep the GPU fed with work, so only enable
+    # for memory debugging.
+    # return f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f}GB"
+    return "xGB"
 
 def input(msg):
     return
@@ -86,6 +92,12 @@ def get_all_parameters(sub_module, recurse=False):
     return itertools.chain(sub_module.named_parameters(recurse=recurse),
                            sub_module.ds_external_parameters())
 
+def iter_params(module: Module, recurse=False) -> Iterable[Parameter]:
+    return map(lambda pair: pair[1], get_all_parameters(module, recurse))
+
+@functools.lru_cache(maxsize=None)
+def get_numel(module: Module) -> int:
+    return sum(p.ds_numel for p in iter_params(module))
 
 #apply torch.autograd.Function that calls a backward_function to tensors in output
 def _apply_to_tensors_only(module, functional, backward_function, outputs):
@@ -169,392 +181,237 @@ def _inject_parameters(module, cls):
         module._parameters = new_param
 
 
-# TODO Needs to be implemented
-class PrefetchCoordinator(object):
-    def __init__(self):
-        # step_id keeps track of the number of sub-modules invoked so far
-        # the step_id is tracking forward and backward sequence of sub-modules
-        self.step_id = 0
+class PartitionedParameterCoordinator:
+    """Handles partitioning and gathering of parameters."""
 
-        # stores the sequence of sub modules in forward+backward pass
-        self.sub_module_trace = []
+    class InflightParamRegistry(UserDict):
+        """registry for parameters in flight"""
+        def __setitem__(self, param: Parameter, handle: AllGatherCoalescedHandle) -> None:
+            if param in self.data:
+                raise RuntimeError(f"{param.ds_summary()} already in registry")
+            if param.ds_status != ZeroParamStatus.INFLIGHT:
+                raise RuntimeError(f"attempted to add non-inflight parameter to registry {param.ds_summary()}")
+            self.data[param] = handle
 
-        # maps sub_module id to submodule objects
-        self.id_to_sub_module_map = {}
-
-        # stores the total number of parmeters in each sub_module
-        self.id_to_sub_module_size_map = {}
-
-        self.trace_completed = False
-
-        self.most_recent_sub_module_step = {}
-
-        # reuse distances
-        self.reuse_numel_for_step_id = {}
-
-    def record_trace(self, sub_module):
-        if not self.trace_completed:
-            self.sub_module_trace.append(sub_module.id)
-            self.id_to_sub_module_map[sub_module.id] = sub_module
-
-    def print_trace(self):
-        print_rank_0(
-            f"The module trace is : {[self.id_to_sub_module_map[module_id].id for module_id in self.sub_module_trace]}",
-            force=True,
-        )
-
-    def increment_step(self, sub_module):
-        self.most_recent_sub_module_step[sub_module.id] = self.step_id
-        self.step_id += 1
-
-    def reset_step(self):
-        self.step_id = 0
-
-    # returns the next numel parameters that will be used next but are not available or inflight
-    @instrument_w_nvtx
-    def get_params_to_prefetch(self, sub_module: Module, numel=2_000_000) -> List[Parameter]:
-        # tracing failed. The sub_module passed at the step_id must match with the sub_module during tracing
-        if sub_module.id != self.sub_module_trace[self.step_id]:
-            print_rank_0(
-                f"Tracing failed. the sub module passed at the step id must match with "
-                f"the sub module during tracing. "
-                f"Prefetching is disabled at sub-module: {debug_module2name_id(sub_module)}"
-            )
-            return []
-
-        params_to_prefetch = []
-        total_numel_to_prefetch = 0
-
-        for i in range(self.step_id, len(self.sub_module_trace)):
-            module_id = self.sub_module_trace[i]
-            for _, param in get_all_parameters(self.id_to_sub_module_map[module_id]):
-                if param.ds_status is ZeroParamStatus.NOT_AVAILABLE and (
-                        param.ds_id not in [p.ds_id for p in params_to_prefetch]):
-                    params_to_prefetch.append(param)
-                    total_numel_to_prefetch += param.ds_numel
-                    #print_rank_0(f"Total numel to prefetch: {total_numel_to_prefetch}. Param: {param.ds_shape} and numel {param.ds_numel}, numel limit {numel}")
-                    if total_numel_to_prefetch >= numel:  # and total_numel_to_prefetch > (numel_in_sub_module // 2):
-                        return params_to_prefetch
-
-        return params_to_prefetch
-
-    # checks if this sub_module will be used again and if so then returns the number of elements
-    # in the parameters used between this sub_module and the reuse of this sub_module
-    @instrument_w_nvtx
-    def get_reuse_distance_in_numel(self, sub_module, sub_module_step_id=None):
-        #assert is_forward is not None, "is_forward must be set to True for Forward Propagation and False for backward Propagation"
-        is_there_reuse = False
-        reuse_distance_in_numel = 1000000000000
-
-        # set the appropriate trace
-        trace = self.sub_module_trace
-        total_steps = len(trace)
-        if sub_module_step_id is None:
-            sub_module_step_id = self.most_recent_sub_module_step[sub_module.id]
-
-        # tracing failed. The sub_module passed at the step_id must match with the sub_module during tracing
-        if sub_module.id != trace[sub_module_step_id]:
-            print_rank_0(
-                f"Tracing failed. Cannot tell if the sub_module: {sub_module.id} is reused"
-            )
-            return reuse_distance_in_numel
-
-        # return cached value
-        if sub_module_step_id in self.reuse_numel_for_step_id:
-            return self.reuse_numel_for_step_id[sub_module_step_id]
-
-        start_step = self.step_id
-        print_rank_0(f"Step id is {self.step_id} ")
-        for step_id in range(start_step, total_steps):
-            print_rank_0(f"Trace id {trace[step_id]} and sub_module id {sub_module.id}")
-            if sub_module.id == trace[step_id]:
-                end_step = step_id
-
-                is_there_reuse = True
-                reuse_distance_in_numel = self._distance_in_numel(
-                    start_step,
-                    end_step,
-                    trace)
-                break
-
-        self.reuse_numel_for_step_id[sub_module_step_id] = reuse_distance_in_numel
-
-        return reuse_distance_in_numel
-
-    @instrument_w_nvtx
-    def _distance_in_numel(self, start_step: int, end_step: int, trace) -> int:
-        distance_in_numel = 0
-        for step_id in range(start_step, end_step):
-            module_id = trace[step_id]
-            for _, param in get_all_parameters(self.id_to_sub_module_map[module_id]):
-                distance_in_numel += param.ds_numel
-
-        return distance_in_numel
-
-class PartitionedParameterCoordinator(object):
-    def __init__(self,
-                 comm_stream=None,
-                 max_reuse_distance_in_numel=500000000,
-                 max_available_parameters_in_numel=700000000):
-
-        self.in_flight_handles = []
-        self.params_in_flight = []
-        self.comm_stream = comm_stream if comm_stream is not None else torch.cuda.current_stream(
-        )
-        self.prefetch_coordinator = PrefetchCoordinator()
+    def __init__(
+        self,
+        prefetch_numel: int,
+        max_reuse_distance_in_numel: int,
+        max_available_parameters_in_numel: int,
+        prefetch_nvme: bool = False,
+    ) -> None:
+        # mapping of param -> handle for each param that is currently in flight
+        self.__inflight_param_registry = PartitionedParameterCoordinator.InflightParamRegistry()
+        # keeps track of the number of submodules invoked so far.
+        self.__step_id = 0
+        # whether or not we have completed a trace of the entire network. This should
+        # always be true after the first forward pass + backward pass.
+        self.__trace_complete = False
+        # sequence of submodules/parameters in forward pass + backward pass
+        self.__submodule_order = []
+        self.__param_order = []
+        self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
+        # number of available params, and max number of available params
+        self.__n_available_params = 0
+        self.__max_n_available_params = max_available_parameters_in_numel
+        # max distance between two use of the module beyond which module is released
+        self.__max_reuse_dist_in_numel = max_reuse_distance_in_numel
+        # queue for parameters to prefetch. parameters will be popped off the left
+        # side of the dequeue as they are prefetched
+        self.__prefetch_queue = None
+        self.__prefetch_numel = prefetch_numel
+        self.__prefetch_nvme = prefetch_nvme
         self.hierarchy = 0
 
-        self.total_available_parameter_numel = 0
-        self.max_available_parameters_in_numel = max_available_parameters_in_numel
+    """Tracing and Tracking
+    TODO. consider performing trace before initializing PartitionedParameterCoordinator
+    and passing trace results into constructor. This way all the code in here can
+    just assume that the trace is complete and the results can be entirely
+    immutable.
 
-        # max distance between two use of the module beyond which module is released
-        self.max_reuse_distance_in_numel = max_reuse_distance_in_numel
+    Bookkeeping operations used to track where we are in the forward/backward pass
+    """
 
-    def _increment_available_parameter_numel(self, increment):
-        self.total_available_parameter_numel += increment
+    def record_trace(self, sub_module: Module) -> None:
+        """adds sub module to trace"""
+        if not self.__trace_complete:
+            self.__submodule_order.append(sub_module)
+            for param in set(iter_params(sub_module)):
+                self.__param_order.append((self.__step_id, param))
 
-    def _decrement_available_parameter_numel(self, decrement):
-        self.total_available_parameter_numel -= decrement
+    def finish_tracing(self) -> None:
+        """express that we have completed tracing"""
+        info_rank_0(f"module trace: {[m.id for m in self.__submodule_order]}")
+        if not self.__trace_complete:
+            self.__submodule_order = tuple(self.__submodule_order)  # freeze
+            self.__param_order = tuple(self.__param_order)  # freeze
+            self.__prefetch_queue = collections.deque(self.__param_order)
+            self.__trace_complete = True
 
-    '''-----------------------Tracing and Prefetching ---------------'''
+    def increment_step(self) -> None:
+        """indicate that we have taken a step forward in the model"""
+        self.__step_id += 1
 
-    def record_trace(self, sub_module):
-        self.prefetch_coordinator.record_trace(sub_module)
+    def reset_step(self) -> None:
+        """indicate that we are about to start a new pass through the model"""
+        self.__prefetch_queue = collections.deque(self.__param_order)  # reset prefetch queue
+        self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
+        self.__step_id = 0
 
-    def finish_tracing(self, print_trace=False):
-        self.prefetch_coordinator.trace_completed = True
+    """Fetch and Release
+    Fetching, prefetching, and releasing parameters
+    """
 
-        if print_trace:
-            self.prefetch_coordinator.print_trace()
+    @instrument_w_nvtx
+    def fetch_sub_module(self, current_submodule: Module) -> None:
+        """
+        1. kick off fetch for immediately required sub module
+        2. kick off fetch for next few submodules (prefetch)
+        3. block on immediately required sub module
+        """
+        info_rank_0(
+            f"{self.__step_id}: M{current_submodule.id} P{[p.ds_id for p in iter_params(current_submodule)]} "
+            + ", ".join(f"{k} {v}" for k, v in {
+                "avail": f"{self.__n_available_params:.1e}",
+                "queue_sz": f"{len(self.__prefetch_queue):.1e}",
+                "inflight": [p.ds_id for p in self.__inflight_param_registry],
+                "allocated": get_cuda_mem_allocated_str()}.items())
+        )
 
-    #swap in parameter partitions from nvme for those parameters that will be used
-    # after the ones that are already being prefetched into full parameters
-    def _prefetch_nvme_param_partitions(self, sub_module, params_in_flight):
-        numel_in_flight = sum([param.ds_tensor.ds_numel for param in params_in_flight])
-        upcoming_param_list = self.prefetch_coordinator.get_params_to_prefetch(
-            sub_module,
-            numel=2 * numel_in_flight)
+        params_to_fetch = frozenset(iter_params(current_submodule))
+        if self.__trace_complete:
+            # pop off the prefetch queue so that we don't fetch again
+            # if params have already been popped off prefetch queue we can ignore them
+            discarded_from_prefetch_queue = set()
+            params_not_already_fetched = set(p for p in params_to_fetch if self.__most_recent_step_id_param_fetched_for[p] < self.__step_id)
+            while self.__prefetch_queue and len(discarded_from_prefetch_queue) < len(params_not_already_fetched):
+                step_id_for_param, param = self.__prefetch_queue.popleft()
+                self.__most_recent_step_id_param_fetched_for[param] = step_id_for_param
+                discarded_from_prefetch_queue.add(param)
+            if discarded_from_prefetch_queue != params_not_already_fetched:
+                raise RuntimeError(f"tracing error: discarded{discarded_from_prefetch_queue}, fetching{params_not_already_fetched}")
+            info_rank_0(f"-discarded from prefetch queue: {set(p.ds_id for p in discarded_from_prefetch_queue)}")
+
+        for param in params_to_fetch:
+            info_rank_0(f"-fetch: {param.ds_summary()}, {get_cuda_mem_allocated_str()}")
+        self.__all_gather_params(params_to_fetch)
+
+        # kick off all gather for the next few submodules (prefetch)
+        max_params_to_prefetch = min(self.__max_n_available_params - self.__n_available_params, self.__prefetch_numel)
+        params_to_prefetch = set()
+        while self.__prefetch_queue and sum(p.ds_numel for p in params_to_prefetch) < max_params_to_prefetch:
+            step_id_for_param, param = self.__prefetch_queue.popleft()
+            self.__most_recent_step_id_param_fetched_for[param] = step_id_for_param
+            params_to_prefetch.add(param)
+        for param in params_to_prefetch:
+            info_rank_0(f"-prefetch: {param.ds_summary()}, {get_cuda_mem_allocated_str()}")
+        self.__all_gather_params(params_to_prefetch)
+
+        if self.__prefetch_nvme:
+            self.__prefetch_nvme_param_partitions()
+
+        # wait for the immediately needed submodule to become available
+        for param in iter_params(current_submodule):
+            param.ds_active_sub_modules.add(current_submodule.id)
+            if param in self.__inflight_param_registry:
+                self.__inflight_param_registry.pop(param).wait()
+            assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
+
+    @instrument_w_nvtx
+    def release_sub_module(self, submodule: Module) -> None:
+        """release the parameters of a sub module, assuming they meet conditions to
+        be released."""
+        # TODO. this is a giant hack that is needed until i figure out why we are
+        # sometimes getting CUDA errors at the end of forward passes.
+        if len(self.__submodule_order) - self.__step_id < 10:
+            torch.cuda.default_stream().synchronize()
+        params_to_release = (
+            self.__params_to_release(submodule, self.__step_id)
+            if self.__trace_complete else set(p.ds_id for p in iter_params(submodule))
+        )
+
+        for param in iter_params(submodule):
+            param.ds_active_sub_modules.discard(submodule.id)
+            if param.ds_id in params_to_release:
+                self.__release_param(param)
+
+    @instrument_w_nvtx
+    def release_and_reset_parameter(self, param: Parameter) -> None:
+        """release a parameter, assuming it meets conditions to be released."""
+        if param in self.__inflight_param_registry:
+            raise RuntimeError(f"param {param.ds_summary()} still in flight")
+        
+        param.ds_active_sub_modules.clear()  # TODO. this should be an error
+        self.__release_param(param)
+
+    @instrument_w_nvtx
+    def __all_gather_params(self, params: Set[Parameter]) -> None:
+        """for each partitioned parameter, kick off an async allgather and store
+        the work handle for the in flight parameters."""
+        partitioned_params = []
+        for param in params:
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                partitioned_params.append(param)
+                self.__n_available_params += param.ds_numel
+
+        if partitioned_params:
+            handle = partitioned_params[0].all_gather_coalesced(partitioned_params)
+            for param in partitioned_params:
+                self.__inflight_param_registry[param] = handle
+
+    @instrument_w_nvtx
+    def __release_param(self, param: Parameter) -> None:
+        mem_before = get_cuda_mem_allocated_str()
+        if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
+            info_rank_0(f"-release: {param.ds_summary()}, {mem_before} -> {get_cuda_mem_allocated_str()}")
+            param.partition()
+            self.__n_available_params -= param.ds_numel
+
+    @instrument_w_nvtx
+    @functools.lru_cache(maxsize=None)
+    def __params_to_release(self, submodule_to_release: Module, step_id: int) -> Set[int]:
+        if not self.__trace_complete:
+            raise RuntimeError("expected trace to be complete")
+
+        params_to_release = set(p.ds_id for p in iter_params(submodule_to_release) if not p.ds_persist)
+
+        # examine all modules within `max_reuse_dist_in_numel` of the current step,
+        # if we see any of the candidate parameters to be released reoccur while
+        # doing this, remove them from the set of parameters to release.
+        params_traversed = 0
+        for module in self.__submodule_order[step_id:]:
+            if params_traversed > self.__max_reuse_dist_in_numel:
+                break
+            for param in iter_params(module):
+                params_to_release.discard(param.ds_id)
+                params_traversed += param.ds_numel
+
+        return params_to_release
+
+    @instrument_w_nvtx
+    def __prefetch_nvme_param_partitions(self) -> None:
+        """swap in parameter partitions from nvme for those parameters that will be used
+        after the ones that are already being prefetched into full parameters
+        """
+        numel_in_flight = sum(param.ds_numel for param in self.__inflight_param_registry)
+
+        numel_considered = 0
         swap_in_params = []
-        for param in upcoming_param_list:
-            if len(swap_in_params) >= param.nvme_swapper.available_swap_in_buffers():
+        for _, param in self.__prefetch_queue:
+            if param.nvme_swapper is None:
+                raise RuntimeError(f"expected param {param.ds_summary()} to have nvme swapper")
+            if (
+                numel_considered > 2 * numel_in_flight or
+                len(swap_in_params) >= param.nvme_swapper.available_swap_in_buffers()
+            ):
                 break
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
                 swap_in_params.append(param)
 
-        if len(swap_in_params) > 0:
+        if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
 
-    # Pre fetches the parameters for sub_modules that comes after
-    #  the current sub_module. This call is asynchronous
-    @instrument_w_nvtx("PartitionedParameterCoordinator.prefetch_next_sub_modules")
-    def prefetch_next_sub_modules(self, sub_module, numel=5000000, nvme=False):
-
-        params_to_prefetch = []
-        if not self.prefetch_coordinator.trace_completed:
-            return params_to_prefetch
-
-        # prefetch if there is no current prefetching in flight
-        if not self.in_flight_handles and self.total_available_parameter_numel < self.max_available_parameters_in_numel:
-            params_to_prefetch = self.prefetch_coordinator.get_params_to_prefetch(
-                sub_module,
-                numel=numel)
-
-            self._all_gather(params_to_prefetch, async_op=True)
-            for param in params_to_prefetch:
-                param.ds_status = ZeroParamStatus.INFLIGHT
-
-                # keeping track of number of elements consumed by available parmaeters
-                self._increment_available_parameter_numel(param.ds_numel)
-
-            if nvme:
-                self._prefetch_nvme_param_partitions(sub_module, params_to_prefetch)
-
-        self._print_prefetch_elements_info(sub_module, params_to_prefetch)
-        print_rank_0(
-            f"{'--' * self.hierarchy}--PreFetching parameters {[param.ds_id for param in params_to_prefetch]} and available {self.total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
-            force=False)
-
-    def _print_prefetch_elements_info(self, sub_module, params_to_prefetch):
-        sub_module_numel = 0.0
-        for name, param in sub_module.named_parameters(recurse=False):
-            sub_module_numel += param.ds_numel
-        numel_being_prefetched = 0
-        for param in params_to_prefetch:
-            numel_being_prefetched = param.ds_numel
-        print_rank_0(
-            f"{'--' * self.hierarchy}--PreFetching  {numel_being_prefetched} numels and number of numel in the next sub module is {sub_module_numel}",
-            force=False)
-
-    def increment_step(self, sub_module):
-        self.prefetch_coordinator.increment_step(sub_module)
-
-    def reset_step(self):
-        self.prefetch_coordinator.reset_step()
-
-    '''----------------------------------------------------------------------'''
-
-    # Fetches the parameters in the sub_module
-    # This call is blocking
-    @instrument_w_nvtx
-    def fetch_sub_module(self, sub_module):
-        partitioned_params = []
-        params_in_flight = False
-        # print_rank_0(f"{'--' * self.hierarchy}Fetching params in module {sub_module.__class__.__name__}")
-        params_to_fetch = [
-            param for _,
-            param in sub_module.named_parameters(recurse=False)
-        ]
-        # print([n for n,p in sub_module.named_parameters(recurse=False)])
-
-        if hasattr(sub_module, 'ds_external_parameters'):
-            print_rank_0(
-                f"{'--' * self.hierarchy}--Fetching external parameters {sub_module.ds_external_parameters()}"
-            )
-            params_to_fetch += [
-                param for _,
-                param in sub_module.ds_external_parameters()
-            ]
-        # for _, param in sub_module.named_parameters(recurse=False):
-        for param in params_to_fetch:
-            param.ds_active_sub_modules += 1
-            print_rank_0(
-                f"{'--' * self.hierarchy}--Fetching parameters {param.ds_id} {param.ds_shape} with active sub modules {param.ds_active_sub_modules}"
-            )
-            if param.ds_status == ZeroParamStatus.AVAILABLE:
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Parameter {param.ds_id} is already available"
-                )
-
-            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Parameter {param.ds_id} is being fetched")
-                partitioned_params.append(param)
-
-                # keeping track of number of elements consumed by available parmaeters
-                self._increment_available_parameter_numel(param.ds_numel)
-                print_rank_0(f"Incrementing with parameter id {param.ds_id}")
-
-            if param.ds_status == ZeroParamStatus.INFLIGHT:
-                params_in_flight = True
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Parameters {param.ds_id} is already in flight (prefetched)"
-                )
-        self.hierarchy += 1
-
-        # parameters are partitioned and need to be allgathered
-        self._all_gather(partitioned_params, async_op=True)
-
-        # parameters are inflight and communication needs to be completed
-        if partitioned_params or params_in_flight:
-            self._synchronize_communication()
-
-        for _, param in sub_module.named_parameters(recurse=False):
-            param.ds_status = ZeroParamStatus.AVAILABLE
-            # print_rank_0(
-            #     f"Param {debug_param2name_id_shape_device(param)} norm={param.norm()}",
-            #     force=False)
-        #print_rank_0(f"After fetching (id, shape, device): {[(param.ds_id, param.shape, param.device) for param in sub_module.named_parameters(recurse=False)]}")
-
-    @instrument_w_nvtx
-    def release_sub_module(self, sub_module):
-        self.hierarchy -= 1
-        print_rank_0(
-            f"{'--' * self.hierarchy}Releasing params in module {debug_module2name_class(sub_module)}"
-        )
-        params_to_release = [
-            param for _,
-            param in sub_module.named_parameters(recurse=False)
-        ]
-
-        if hasattr(sub_module, 'ds_external_parameters'):
-            #print_rank_0(f"Releasing external parameters {sub_module.ds_external_parameters()}")
-            params_to_release += [
-                param for _,
-                param in sub_module.ds_external_parameters()
-            ]
-
-        # for _, param in sub_module.named_parameters(recurse=False):
-        for param in params_to_release:
-            param.ds_active_sub_modules -= 1
-            if not param.ds_active_sub_modules and not self._keep_for_later(
-                    sub_module) and not param.ds_persist:
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Releasing parameter {debug_param2name_id_numel(param)} active sub modules {param.ds_active_sub_modules} and keep for later {self._keep_for_later(sub_module)}",
-                    force=False)
-
-                # Keeping track of number of elements that are consumed by available parameters
-                self._decrement_available_parameter_numel(param.ds_numel)
-                see_memory_usage(
-                    f"Before releasing param {debug_param2name_id_numel(param)}",
-                    force=False)
-                with torch.cuda.nvtx.range("PartitionedParameterCoordinator.release_sub_module::param_partition"):
-                    param.partition(hierarchy=self.hierarchy)
-                see_memory_usage(
-                    f"After releasing param {debug_param2name_id_numel(param)}",
-                    force=False)
-
-                param.ds_status = ZeroParamStatus.NOT_AVAILABLE
-            else:
-
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Did not release param {debug_param2name_id_numel(param)} with active sub modules {param.ds_active_sub_modules}, keep for later={self._keep_for_later(sub_module)} and persistence={param.ds_persist}",
-                    force=False)
-
-    def release_and_reset_parameter(self, param):
-        param.ds_active_sub_modules = 0
-        if param.ds_status == ZeroParamStatus.AVAILABLE:
-            print_rank_0(
-                f"Releasing unpartitioned param {debug_param2name_id_numel(param)} active sub-modules {param.ds_active_sub_modules} and persisitence {param.ds_persist}"
-            )
-            self._decrement_available_parameter_numel(param.ds_numel)
-            param.partition()
-
-    @instrument_w_nvtx
-    def _keep_for_later(self, sub_module):
-        if not self.prefetch_coordinator.trace_completed:
-            return False
-        if self.max_reuse_distance_in_numel == 0:
-            return False
-        reuse_distance_in_numel = self.prefetch_coordinator.get_reuse_distance_in_numel(
-            sub_module)
-        #print_rank_0(f"Reuse distance and numel for sub_module id {sub_module.id} is {reuse_distance_in_numel}")
-        return reuse_distance_in_numel < self.max_reuse_distance_in_numel
-
-    @instrument_w_nvtx
-    def _all_gather(self, partitioned_params, async_op=False):
-        with torch.cuda.stream(self.comm_stream):
-            handles = partitioned_params[0].all_gather(
-                param_list=partitioned_params,
-                async_op=async_op,
-                hierarchy=self.hierarchy) if partitioned_params else None
-
-        if handles is not None:
-            self.in_flight_handles.extend(handles)
-            self.params_in_flight.extend(partitioned_params)
-
-    @instrument_w_nvtx
-    def _synchronize_communication(self, synchronize_streams=True):
-        assert len(self.params_in_flight) == len(self.in_flight_handles)
-        for handle, param in zip(self.in_flight_handles, self.params_in_flight):
-            if handle is not None:
-                with torch.cuda.nvtx.range(
-                    "PartitionedParameterCoordinator._synchronize_communication::inflight_handle_wait"
-                ):
-                    with torch.cuda.stream(self.comm_stream):
-                        handle.wait()
-            param.ds_status = ZeroParamStatus.AVAILABLE
-        with torch.cuda.nvtx.range(
-            "PartitionedParameterCoordinator._synchronize_communication::comm_stream_sync"
-        ):
-            self.comm_stream.synchronize()
-
-        if synchronize_streams:
-            with torch.cuda.nvtx.range(
-                "PartitionedParameterCoordinator._synchronize_communication::cuda_sync"
-            ):
-                torch.cuda.synchronize()
-        self.in_flight_handles = []
-        self.params_in_flight = []
+        info_rank_0(f"-swapping in {swap_in_params}")
 
 
 class PreBackwardFunction(torch.autograd.Function):
@@ -730,11 +587,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage("Before Partitioned Parameter Coordinator", force=False)
 
-        fetch_stream = torch.cuda.Stream() if self.overlap_comm else None
         self.param_coordinator = PartitionedParameterCoordinator(
-            comm_stream=fetch_stream,
+            prefetch_numel=int(prefetch_bucket_size),
             max_reuse_distance_in_numel=int(max_reuse_distance),
-            max_available_parameters_in_numel=int(max_live_parameters))
+            max_available_parameters_in_numel=int(max_live_parameters),
+            prefetch_nvme=self.params_in_nvme_and_cpu,
+        )
 
         see_memory_usage("After Partitioned Parameter Coordinator", force=False)
 
@@ -1476,7 +1334,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             for item in filter(lambda item: is_zero_param(item), output):
                 if not any(id(item) in m._external_params for m in FWD_MODULE_STACK):
-                    item.ds_active_sub_modules += 1
                     module_to_register = FWD_MODULE_STACK[-1]
                     print_rank_0(
                         f'Registering dangling parameter for module {module_to_register.__class__.__name__}.',
@@ -1567,15 +1424,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
 
-        self.param_coordinator.prefetch_next_sub_modules(
-            sub_module,
-            numel=self.prefetch_elements,
-            nvme=self.params_in_nvme_and_cpu)
-        see_memory_usage(
-            f"Before sub module function {sub_module.__class__.__name__} after prefetch",
-            force=False)
-
-        self.param_coordinator.increment_step(sub_module)
+        self.param_coordinator.increment_step()
 
     @instrument_w_nvtx
     def post_sub_module_forward_function(self, sub_module):
@@ -1592,13 +1441,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def pre_sub_module_backward_function(self, sub_module):
         self.param_coordinator.record_trace(sub_module)
-
         self.param_coordinator.fetch_sub_module(sub_module)
-
-        self.param_coordinator.prefetch_next_sub_modules(sub_module,
-                                                         numel=self.prefetch_elements)
-
-        self.param_coordinator.increment_step(sub_module)
+        self.param_coordinator.increment_step()
 
     @instrument_w_nvtx
     def post_sub_module_backward_function(self, sub_module):
@@ -2598,7 +2442,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         print_rank_0("Finished Tracing at Beginning of Step")
         self.param_coordinator.hierarchy = 0
-        self.param_coordinator.finish_tracing(print_trace=True)
+        self.param_coordinator.finish_tracing()
 
         self.param_coordinator.reset_step()
 
@@ -2970,9 +2814,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
         """
         self.micro_step_id += 1
-        print_rank_0(
-            f"Total fully available parameters {self.param_coordinator.total_available_parameter_numel}"
-        )
 
         if self.swap_optimizer:
             self.optimizer_swapper.pre_backward()
@@ -3005,6 +2846,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def _partition_all_parameters(self):
         for name, param in self.module.named_parameters(recurse=True):
+            # assert not param.ds_active_sub_modules, param.ds_summary()
             self.param_coordinator.release_and_reset_parameter(param)
 
     def check_overflow(self, partition_gradients=True):
