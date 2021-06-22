@@ -1405,7 +1405,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
-        self._register_hooks_recursively(self.module)
 
         #reset step at the beginning of forward
         @instrument_w_nvtx
@@ -1420,8 +1419,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self.param_coordinator.reset_step()
 
         #likely one of them should be enough but just to be safe
-        self.module.register_forward_hook(_end_of_forward_hook)
         self.module.register_forward_pre_hook(_pre_forward_hook)
+        self._register_hooks_recursively(self.module)
+        self.module.register_forward_hook(_end_of_forward_hook)
 
         # Add top todule to stack trace
         global FWD_MODULE_STACK
