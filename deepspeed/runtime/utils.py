@@ -632,3 +632,11 @@ def call_to_str(base, *args, **kwargs):
         name += ', '.join(f'{key}={repr(arg)}' for key, arg in kwargs.items())
     name += ')'
     return name
+
+def info_rank_0(message: str) -> None:
+    if dist.get_rank() == 0:
+        logger.info(message)
+
+def warn_rank_0(message: str) -> None:
+    if dist.get_rank() == 0:
+        logger.warn(message)

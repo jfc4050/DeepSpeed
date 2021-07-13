@@ -13,6 +13,8 @@ import torch.distributed as dist
 import math
 from torch._six import inf
 from torch.autograd import Variable
+from torch.nn import Module
+from torch.nn.parameter import Parameter
 
 from deepspeed.utils.logging import logger
 from deepspeed.runtime.fp16.loss_scaler import LossScaler, DynamicLossScaler
@@ -45,6 +47,9 @@ def print_rank_0(message, debug=False, force=False):
     # - print to log file per rank
     # log_rank_file(rank, message)
 
+def warn_rank_0(message: str) -> None:
+    if torch.distributed.get_rank() == 0:
+        logger.warn(message)
 
 def input(msg):
     return
@@ -78,6 +83,7 @@ def move_to_cpu(tensor_list):
         tensor.data = tensor.data.cpu()
 
 
+@instrument_w_nvtx
 def get_all_parameters(sub_module, recurse=False):
     return itertools.chain(sub_module.named_parameters(recurse=recurse),
                            sub_module.ds_external_parameters())
@@ -195,7 +201,8 @@ class PrefetchCoordinator(object):
 
     def print_trace(self):
         print_rank_0(
-            f"The module trace is : {[self.id_to_sub_module_map[module_id].id for module_id in self.sub_module_trace]}"
+            f"The module trace is : {[self.id_to_sub_module_map[module_id].id for module_id in self.sub_module_trace]}",
+            force=True,
         )
 
     def increment_step(self, sub_module):
@@ -206,19 +213,14 @@ class PrefetchCoordinator(object):
         self.step_id = 0
 
     # returns the next numel parameters that will be used next but are not available or inflight
-    def get_params_to_prefetch(self, sub_module, numel=2000000):
-
-        # numel_in_sub_module = 0
-        # for name, param in sub_module.named_parameters(recurse=False):
-        #     numel_in_sub_module += param.ds_numel
-
-        # #if numel_in_sub_module < (numel // 2):
-        #    return []
-
+    @instrument_w_nvtx
+    def get_params_to_prefetch(self, sub_module: Module, numel=2_000_000) -> List[Parameter]:
         # tracing failed. The sub_module passed at the step_id must match with the sub_module during tracing
         if sub_module.id != self.sub_module_trace[self.step_id]:
             print_rank_0(
-                f"Tracing failed. Prefetching is disabled at sub-module: {debug_module2name_id(sub_module)}"
+                f"Tracing failed. the sub module passed at the step id must match with "
+                f"the sub module during tracing. "
+                f"Prefetching is disabled at sub-module: {debug_module2name_id(sub_module)}"
             )
             return []
 
@@ -240,6 +242,7 @@ class PrefetchCoordinator(object):
 
     # checks if this sub_module will be used again and if so then returns the number of elements
     # in the parameters used between this sub_module and the reuse of this sub_module
+    @instrument_w_nvtx
     def get_reuse_distance_in_numel(self, sub_module, sub_module_step_id=None):
         #assert is_forward is not None, "is_forward must be set to True for Forward Propagation and False for backward Propagation"
         is_there_reuse = False
@@ -280,16 +283,15 @@ class PrefetchCoordinator(object):
 
         return reuse_distance_in_numel
 
-    def _distance_in_numel(self, start_step, end_step, trace):
+    @instrument_w_nvtx
+    def _distance_in_numel(self, start_step: int, end_step: int, trace) -> int:
         distance_in_numel = 0
         for step_id in range(start_step, end_step):
             module_id = trace[step_id]
-            for _, param in self.id_to_sub_module_map[module_id].named_parameters(recurse=False):
+            for _, param in get_all_parameters(self.id_to_sub_module_map[module_id]):
                 distance_in_numel += param.ds_numel
-            for _, param in self.id_to_sub_module_map[module_id].ds_external_parameters():
-                distance_in_numel += param.ds_numel
-        return distance_in_numel
 
+        return distance_in_numel
 
 class PartitionedParameterCoordinator(object):
     def __init__(self,
@@ -346,6 +348,7 @@ class PartitionedParameterCoordinator(object):
 
     # Pre fetches the parameters for sub_modules that comes after
     #  the current sub_module. This call is asynchronous
+    @instrument_w_nvtx
     def prefetch_next_sub_modules(self, sub_module, numel=5000000, nvme=False):
 
         params_to_prefetch = []
@@ -394,6 +397,7 @@ class PartitionedParameterCoordinator(object):
 
     # Fetches the parameters in the sub_module
     # This call is blocking
+    @instrument_w_nvtx
     def fetch_sub_module(self, sub_module):
         partitioned_params = []
         params_in_flight = False
@@ -420,7 +424,6 @@ class PartitionedParameterCoordinator(object):
             print_rank_0(
                 f"{'--' * self.hierarchy}--Fetching parameters {debug_param2name_id_shape(param)} with active sub modules {param.ds_active_sub_modules}"
             )
-
             if param.ds_status == ZeroParamStatus.AVAILABLE:
                 print_rank_0(
                     f"{'--' * self.hierarchy}--Parameter {debug_param2name_id(param)} is already available"
@@ -457,6 +460,7 @@ class PartitionedParameterCoordinator(object):
                 force=False)
         #print_rank_0(f"After fetching (id, shape, device): {[(param.ds_id, param.shape, param.device) for param in sub_module.named_parameters(recurse=False)]}")
 
+    @instrument_w_nvtx
     def release_sub_module(self, sub_module):
         self.hierarchy -= 1
         print_rank_0(
@@ -488,7 +492,8 @@ class PartitionedParameterCoordinator(object):
                 see_memory_usage(
                     f"Before releasing param {debug_param2name_id_numel(param)}",
                     force=False)
-                param.partition(hierarchy=self.hierarchy)
+                with torch.cuda.nvtx.range("PartitionedParameterCoordinator.release_sub_module::param_partition"):
+                    param.partition(hierarchy=self.hierarchy)
                 see_memory_usage(
                     f"After releasing param {debug_param2name_id_numel(param)}",
                     force=False)
@@ -509,6 +514,7 @@ class PartitionedParameterCoordinator(object):
             self._decrement_available_parameter_numel(param.ds_numel)
             param.partition()
 
+    @instrument_w_nvtx
     def _keep_for_later(self, sub_module):
         if not self.prefetch_coordinator.trace_completed:
             return False
@@ -519,6 +525,7 @@ class PartitionedParameterCoordinator(object):
         #print_rank_0(f"Reuse distance and numel for sub_module id {sub_module.id} is {reuse_distance_in_numel}")
         return reuse_distance_in_numel < self.max_reuse_distance_in_numel
 
+    @instrument_w_nvtx
     def _all_gather(self, partitioned_params, async_op=False):
         with torch.cuda.stream(self.comm_stream):
             handles = partitioned_params[0].all_gather(
@@ -530,15 +537,27 @@ class PartitionedParameterCoordinator(object):
             self.in_flight_handles.extend(handles)
             self.params_in_flight.extend(partitioned_params)
 
+    @instrument_w_nvtx
     def _synchronize_communication(self, synchronize_streams=True):
         assert len(self.params_in_flight) == len(self.in_flight_handles)
         for handle, param in zip(self.in_flight_handles, self.params_in_flight):
             if handle is not None:
-                with torch.cuda.stream(self.comm_stream):
-                    handle.wait()
+                with torch.cuda.nvtx.range(
+                    "PartitionedParameterCoordinator._synchronize_communication::inflight_handle_wait"
+                ):
+                    with torch.cuda.stream(self.comm_stream):
+                        handle.wait()
             param.ds_status = ZeroParamStatus.AVAILABLE
-        self.comm_stream.synchronize()
-        torch.cuda.synchronize() if synchronize_streams else None
+        with torch.cuda.nvtx.range(
+            "PartitionedParameterCoordinator._synchronize_communication::comm_stream_sync"
+        ):
+            self.comm_stream.synchronize()
+
+        if synchronize_streams:
+            with torch.cuda.nvtx.range(
+                "PartitionedParameterCoordinator._synchronize_communication::cuda_sync"
+            ):
+                torch.cuda.synchronize()
         self.in_flight_handles = []
         self.params_in_flight = []
 
@@ -1396,10 +1415,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self._register_hooks_recursively(self.module)
 
         #reset step at the beginning of forward
+        @instrument_w_nvtx
         def _pre_forward_hook(module, *args):
             self.param_coordinator.reset_step()
 
         #reset step if in inference mode
+        @instrument_w_nvtx
         def _end_of_forward_hook(module, *args):
 
             if not torch._C.is_grad_enabled():
@@ -1543,6 +1564,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # post backward hook
         module.register_forward_pre_hook(_post_backward_module_hook)
 
+    @instrument_w_nvtx
     def pre_sub_module_forward_function(self, sub_module):
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}",
                          force=False)
@@ -1567,6 +1589,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.param_coordinator.increment_step(sub_module)
 
+    @instrument_w_nvtx
     def post_sub_module_forward_function(self, sub_module):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
@@ -1578,6 +1601,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
             force=False)
 
+    @instrument_w_nvtx
     def pre_sub_module_backward_function(self, sub_module):
         self.param_coordinator.record_trace(sub_module)
 
@@ -1588,6 +1612,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.param_coordinator.increment_step(sub_module)
 
+    @instrument_w_nvtx
     def post_sub_module_backward_function(self, sub_module):
         see_memory_usage(
             f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} before release",
@@ -1605,6 +1630,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             self.grads_in_partition_offset = 0
 
+    @instrument_w_nvtx
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
@@ -2774,6 +2800,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         else:
             self._partitioned_params_swap_out(sub_group_id)
 
+    @instrument_w_nvtx
     def step(self, closure=None):
         """
             Not supporting closure.
@@ -2945,6 +2972,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 return True
             return False
 
+    @instrument_w_nvtx
     def backward(self, loss, retain_graph=False):
         """
         :attr:`backward` performs the following steps:
@@ -2986,6 +3014,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if self.swap_optimizer:
             self.optimizer_swapper.post_backward()
 
+    @instrument_w_nvtx
     def _partition_all_parameters(self):
         for name, param in self.module.named_parameters(recurse=True):
             self.param_coordinator.release_and_reset_parameter(param)
