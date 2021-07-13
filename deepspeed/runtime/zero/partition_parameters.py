@@ -17,7 +17,7 @@ from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
 
 from ..utils import see_memory_usage
-from deepspeed.utils import log_dist, init_distributed
+from deepspeed.utils import log_dist, init_distributed, instrument_w_nvtx
 from deepspeed.utils.debug import debug_param2name_id_shape, debug_param2name_id_shape_device, debug_module2name, debug_param2name, debug_param2name_id_shape_status, printflock, log_rank_file
 
 from ..swap_tensor.partitioned_param_swapper import AsyncPartitionedParameterSwapper, PartitionedParamStatus
@@ -609,6 +609,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         def partitioned_size():
             return self._partitioned_size(param)
 
+        def ds_summary(slf):
+            return {
+                "id": slf.ds_id,
+                "status": slf.ds_status,
+                "numel": slf.ds_numel,
+            }
+
         # Collectives for gathering and partitioning parameters
         param.all_gather = all_gather
         param.partition = partition
@@ -621,6 +628,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.aligned_size = aligned_size
         param.padding_size = padding_size
         param.partitioned_size = partitioned_size
+        param.ds_summary = types.MethodType(ds_summary, param)
 
     def _aligned_size(self, param):
         return param.ds_numel + self._padding_size(param)
@@ -647,6 +655,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         elif len(swap_in_flight) > 0:
             swap_in_flight[0].nvme_swapper.synchronize_reads()
 
+    @instrument_w_nvtx
     def _all_gather(self, param_list, async_op=False, hierarchy=None):
 
         #fetches from nvme if the partition is not available and in nvme
@@ -685,6 +694,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #print_rank_0(f"After Partitioning Param {param.ds_id}")
             # self._param_status(param)
 
+    @instrument_w_nvtx
     def _partition_param(self, param, buffer=None, has_been_updated=False):
         assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot parititon a param in flight"
 
@@ -820,6 +830,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 f"Param id {param.ds_id}, param status: {param.ds_status}, param numel {param.ds_numel}, partitioned ds_tensor {param.ds_tensor}, data numel {param.data.numel()}"
             )
 
+    @instrument_w_nvtx
     def _allgather_param(self, param, async_op=False, hierarchy=0):
 
         partition_size = param.ds_tensor.ds_numel
@@ -962,6 +973,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                                                         0,
                                                                         elements))
 
+    @instrument_w_nvtx
     def _reduce_scatter_gradient(self, param):
 
         partition_size = param.ds_tensor.ds_numel
@@ -1011,6 +1023,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                      partition_buffer=partition_buffer,
                                      accumulate=accumulate)
 
+    @instrument_w_nvtx
     def _partition_gradient(self, param, partition_buffer=None, accumulate=False):
         #import pdb;pdb.set_trace()
         # param.grad=None
