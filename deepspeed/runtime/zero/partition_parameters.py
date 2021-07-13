@@ -11,7 +11,9 @@ import functools
 import itertools
 
 import torch
+from torch.cuda import Stream
 from torch.distributed.distributed_c10d import _get_global_rank
+from torch.nn import Parameter
 
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
@@ -206,6 +208,11 @@ def get_all_subclasses(cls):
 
     return set(subclass_list)
 
+@instrument_w_nvtx
+def free_param(param: Parameter) -> None:
+    """Free underlying storage of a parameter."""
+    # param.data doesn't store anything meaningful in partitioned state
+    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
 
 reuse_buffers = False
 temp_contiguous_tensor = None
@@ -487,6 +494,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 self._convert_to_deepspeed_param(param)
                 param.partition()
 
+        # cuda stream used for deallocating memory
+        self.dealloc_stream = Stream()
+
     def _validate_remote_device(self, remote_device, ds_config):
         if ds_config is not None:
             _ds_config = DeepSpeedConfig(ds_config)
@@ -718,14 +728,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             if param.ds_tensor is not None and not has_been_updated:
 
                 #param.data = param.ds_tensor.data
-
-                see_memory_usage(
-                    f'Before partitioning param {param.ds_id} {param.shape}',
-                    force=False)
-                #param.data does not store anything meaningful in partitioned state
-                param.data = torch.ones(1, dtype=self.dtype).to(param.device)
-                see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
-                                 force=False)
+                with torch.cuda.stream(self.dealloc_stream):
+                    see_memory_usage(f"before partitioning {param.ds_summary()}")
+                    free_param(param)
+                    see_memory_usage(f"after partitioning {param.ds_summary()}")
 
                 if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
                     print_rank_0(
@@ -744,7 +750,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         numel=partition_size):
                     final_location = OFFLOAD_NVME_DEVICE
                     buffer = self.param_swapper.get_buffer(param, partition_size)
-                    partitioned_tensor = torch.zeros(1,
+                    partitioned_tensor = torch.empty(0,
                                                      dtype=param.dtype,
                                                      device=buffer.device)
                     partitioned_tensor.data = buffer.data
@@ -804,7 +810,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}',
                              force=False)
-            param.data = torch.ones(1, dtype=self.dtype).to(param.device)
+            free_param(param)
             see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
                              force=False)
 
