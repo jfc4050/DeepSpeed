@@ -328,10 +328,6 @@ class PartitionedParameterCoordinator:
     def release_sub_module(self, submodule: Module) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
-        # TODO. this is a giant hack that is needed until i figure out why we are
-        # sometimes getting CUDA errors at the end of forward passes.
-        if len(self.__submodule_order) - self.__step_id < 10:
-            torch.cuda.default_stream().synchronize()
         params_to_release = (
             self.__params_to_release(submodule, self.__step_id)
             if self.__trace_complete else set(p.ds_id for p in iter_params(submodule))
