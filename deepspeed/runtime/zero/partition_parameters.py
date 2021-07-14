@@ -731,7 +731,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         def partitioned_size():
             return self._partitioned_size(param)
 
-        def ds_summary(slf):
+        def ds_summary(slf: torch.Tensor) -> dict:
             return {
                 "id": slf.ds_id,
                 "status": slf.ds_status.name,
@@ -739,6 +739,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 "ds_numel": slf.ds_numel,
                 "shape": tuple(slf.shape),
                 "ds_shape": tuple(slf.ds_shape),
+                "requires_grad": slf.requires_grad,
                 "grad_shape": tuple(slf.grad.shape) if slf.grad is not None else None,
                 "persist": slf.ds_persist,
                 "active_sub_modules": slf.ds_active_sub_modules,
