@@ -21,7 +21,7 @@ from torch.nn.parameter import Parameter
 
 from deepspeed.utils.logging import logger
 from deepspeed.runtime.fp16.loss_scaler import LossScaler, DynamicLossScaler
-from deepspeed.runtime.utils import see_memory_usage, is_model_parallel_parameter
+from deepspeed.runtime.utils import info_rank_0, see_memory_usage, is_model_parallel_parameter
 from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.partition_parameters import _init_external_params
 from deepspeed.runtime.zero.constants import ZERO_OPTIMIZATION_WEIGHTS
@@ -44,13 +44,6 @@ def print_rank_0(message, debug=False, force=False):
     if torch.distributed.get_rank() == 0 and (debug or force):
         logger.info(message)
 
-def info_rank_0(message: str) -> None:
-    if dist.get_rank() == 0:
-        print(message)
-
-def warn_rank_0(message: str) -> None:
-    if torch.distributed.get_rank() == 0:
-        logger.warn(message)
 
 def get_cuda_mem_allocated_str() -> str:
     # this is really slow. when enabled the python process becomes slow

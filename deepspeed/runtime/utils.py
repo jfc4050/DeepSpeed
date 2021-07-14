@@ -635,8 +635,5 @@ def call_to_str(base, *args, **kwargs):
 
 def info_rank_0(message: str) -> None:
     if dist.get_rank() == 0:
-        logger.info(message)
+        print(message)
 
-def warn_rank_0(message: str) -> None:
-    if dist.get_rank() == 0:
-        logger.warn(message)
