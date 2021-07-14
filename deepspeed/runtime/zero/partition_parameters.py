@@ -1153,6 +1153,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         #import pdb;pdb.set_trace()
         # param.grad=None
         # param.grad.test()
+        info_rank_0(f"-partition grad for: {param.ds_summary()}")
         print_rank_0(
             f"Partitioning param {param.ds_id} gradient of size {param.grad.numel()} type {param.grad.dtype} part_size {param.ds_tensor.ds_numel}"
         )
