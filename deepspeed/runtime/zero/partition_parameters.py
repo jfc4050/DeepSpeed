@@ -387,15 +387,7 @@ class AllGatherCoalescedHandle:
                         )
                         partitions.append(part_to_copy)
 
-                tensor_devices = set(p.device for p in partitions)
-                if len(tensor_devices) != 1:
-                    raise RuntimeError("expected all partitions to be on same device")
-                tensor_device, = tensor_devices
-
-                replicated_tensor = torch.empty(
-                    param.ds_shape, dtype=param.dtype, device=tensor_device
-                )
-                instrument_w_nvtx(torch.cat)(partitions, out=replicated_tensor.view(-1))  # single kernel launch
+                replicated_tensor = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
 
                 param.data = replicated_tensor.data
                 param.ds_status = ZeroParamStatus.AVAILABLE
