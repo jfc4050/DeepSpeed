@@ -661,7 +661,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 offset = 0
                 for p in params_to_gather:
                     param_numel = p.ds_tensor.ds_numel
-                    partitions[self.rank].narrow(0, offset, param_numel).copy_(p.ds_tensor.data)
+                    partitions[self.rank].narrow(0, offset, param_numel).copy_(p.ds_tensor.data, non_blocking=True)
                     offset += param_numel
 
                 all_gather_handle = instrument_w_nvtx(torch.distributed.all_gather)(
