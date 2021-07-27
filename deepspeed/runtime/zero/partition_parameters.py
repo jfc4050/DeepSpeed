@@ -12,6 +12,7 @@ import itertools
 
 import torch
 from torch.cuda import Stream
+import torch.distributed
 from torch.distributed.distributed_c10d import _get_global_rank
 from torch.nn import Parameter
 
@@ -671,8 +672,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     partitions[self.rank].narrow(0, offset, param_numel).copy_(p.ds_tensor.data, non_blocking=True)
                     offset += param_numel
 
-                all_gather_handle = instrument_w_nvtx(torch.distributed.all_gather)(
-                    partitions,
+                all_gather_handle = instrument_w_nvtx(torch.distributed._all_gather_base)(
+                    flat_tensor,
                     partitions[self.rank],
                     group=self.ds_process_group,
                     async_op=True,
