@@ -641,6 +641,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 for p in filter(lambda p: p.ds_status == ZeroParamStatus.NOT_AVAILABLE, params):
                     p.ds_status = ZeroParamStatus.INFLIGHT
                     params_to_gather.append(p)
+                # ensure that each rank has params in same order. the allgather
+                # is done by flattening the parameter list into a single tensor that
+                # can be allgathered in a single call - this means that if each rank
+                # gives a list of the same parameters in a different order we will
+                # silently get incorrect parameter values, and have very difficult
+                # to debug correctness issues.
+                params_to_gather.sort(key=lambda p: p.ds_id)
 
                 partition_sz = sum(p.ds_tensor.ds_numel for p in params_to_gather)
 
