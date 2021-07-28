@@ -236,21 +236,18 @@ class PartitionedParameterCoordinator:
             for param in set(iter_params(sub_module)):
                 self.__param_order.append((self.__step_id, param))
 
-    def finish_tracing(self) -> None:
-        """express that we have completed tracing"""
-        info_rank_0(f"module trace: {[m.id for m in self.__submodule_order]}")
-        if not self.__trace_complete:
-            self.__submodule_order = tuple(self.__submodule_order)  # freeze
-            self.__param_order = tuple(self.__param_order)  # freeze
-            self.__param_queue = collections.deque(self.__param_order)
-            self.__trace_complete = True
-
     def increment_step(self) -> None:
         """indicate that we have taken a step forward in the model"""
         self.__step_id += 1
 
     def reset_step(self) -> None:
-        """indicate that we are about to start a new pass through the model"""
+        """indicate that we have completed one fwd+bwd for the model"""
+        info_rank_0(f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}")
+        if not self.__trace_complete:
+            self.__submodule_order = tuple(self.__submodule_order)  # freeze
+            self.__param_order = tuple(self.__param_order)  # freeze
+            self.__trace_complete = True
+
         self.__param_queue = collections.deque(self.__param_order)  # reset fetch queue
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
         self.__step_id = 0
@@ -270,7 +267,7 @@ class PartitionedParameterCoordinator:
             f"{self.__step_id}: M{current_submodule.id}({type(current_submodule).__name__}) P{[p.ds_id for p in iter_params(current_submodule)]} "
             + str({
                 "avail": f"{self.__n_available_params:.1e}",
-                "queue_sz": f"{len(self.__param_queue)}",
+                "queue_sz": f"{len(self.__param_queue or [])}",
                 "inflight": [p.ds_id for p in self.__inflight_param_registry],
                 "allocated": get_cuda_mem_allocated_str()
             })
@@ -292,8 +289,8 @@ class PartitionedParameterCoordinator:
                 raise RuntimeError(
                     f"tracing error at step {self.__step_id}: "
                     f"expected the next {len(params_not_already_fetched)} parameters in the "
-                    f"parameter fetch queue to be {params_not_already_fetched} "
-                    f"but got {discarded_from_prefetch_queue}."
+                    f"parameter fetch queue to be {tuple(p.ds_summary() for p in params_not_already_fetched)} "
+                    f"but got {tuple(p.ds_summary() for p in discarded_from_prefetch_queue)}."
                 )
             info_rank_0(f"-discarded from prefetch queue: {set(p.ds_id for p in discarded_from_prefetch_queue)}")
 
@@ -334,7 +331,9 @@ class PartitionedParameterCoordinator:
         )
 
         for param in iter_params(submodule):
-            param.ds_active_sub_modules.remove(submodule.id)
+            # TODO. we should be able to have this as .remove().
+            # figure out why submodule id isnt already in the set
+            param.ds_active_sub_modules.discard(submodule.id)
             if param.ds_id in params_to_release:
                 self.__release_param(param)
 
@@ -1272,20 +1271,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
 
-        #reset step at the beginning of forward
-        @instrument_w_nvtx
-        def _pre_forward_hook(module, *args):
-            self.param_coordinator.reset_step()
-
         #reset step if in inference mode
         @instrument_w_nvtx
         def _end_of_forward_hook(module, *args):
-
             if not torch._C.is_grad_enabled():
                 self.param_coordinator.reset_step()
 
         #likely one of them should be enough but just to be safe
-        self.module.register_forward_pre_hook(_pre_forward_hook)
         self._register_hooks_recursively(self.module)
         self.module.register_forward_hook(_end_of_forward_hook)
 
@@ -2455,9 +2447,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         print_rank_0("Finished Tracing at Beginning of Step")
         self.param_coordinator.hierarchy = 0
-        self.param_coordinator.finish_tracing()
-
-        self.param_coordinator.reset_step()
 
         print_rank_0("Finished Tracing at Beginning of Step")
 
@@ -2848,6 +2837,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.ipg_index = 0
 
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
+
+        self.param_coordinator.reset_step()
+
         '''Partitioning Parameters that were not partitioned
         Usually if parameters of modules whose input parameters do not require
         grad computation do not trigger post call and will therefore will remain unpartitioned '''
