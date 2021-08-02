@@ -233,7 +233,7 @@ class PartitionedParameterCoordinator:
         """adds sub module to trace"""
         if not self.__trace_complete:
             self.__submodule_order.append(sub_module)
-            for param in set(iter_params(sub_module)):
+            for param in sorted(set(iter_params(sub_module)), key=lambda p: p.ds_id):
                 self.__param_order.append((self.__step_id, param))
 
     def increment_step(self) -> None:
