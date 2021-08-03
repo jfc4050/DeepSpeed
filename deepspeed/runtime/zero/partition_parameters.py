@@ -3,12 +3,14 @@
 Licensed under the MIT license.
 """
 
+from deepspeed.runtime.zero.utils import assert_ints_same_as_other_ranks
 import os
 import time
 import types
 from enum import Enum
 import functools
 import itertools
+from typing import List
 
 import torch
 from torch.cuda import Stream
@@ -633,7 +635,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             return self._all_gather(param_list, async_op=async_op, hierarchy=hierarchy)
 
         @instrument_w_nvtx
-        def all_gather_coalesced(params) -> AllGatherCoalescedHandle:
+        def all_gather_coalesced(params, safe_mode=False) -> AllGatherCoalescedHandle:
             with torch.cuda.stream(self.comm_stream):
                 # fetches from nvme if the partition is not available and in nvme
                 self._ensure_availability_of_partitioned_params(params)
@@ -650,6 +652,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 # to debug correctness issues.
                 params_to_gather.sort(key=lambda p: p.ds_id)
 
+                if safe_mode:
+                    # ensure that same list (with same ordering) of parameters are
+                    # being allgathered across all ranks, otherwise could mix
+                    # data between tensors.
+                    assert_ints_same_as_other_ranks([p.ds_id for p in params_to_gather])
+                    # ensure that tensors from each rank agree on the same ds_numel
+                    # otherwise could mix data between tensors.
+                    assert_ints_same_as_other_ranks([p.ds_tensor.ds_numel for p in params_to_gather])
+
                 partition_sz = sum(p.ds_tensor.ds_numel for p in params_to_gather)
 
                 data_types = set(p.dtype for p in params_to_gather)
@@ -662,7 +673,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     device=self.local_device,
                     requires_grad=False
                 )
-                partitions = []
+                partitions: List[Parameter] = []
                 for i in range(self.world_size):
                     partitions.append(flat_tensor.narrow(0, partition_sz * i, partition_sz))
 

@@ -178,6 +178,17 @@ def _inject_parameters(module, cls):
         module._parameters = new_param
 
 
+def _get_lst_from_rank0(lst: List[int]) -> None:
+    lst = lst if dist.get_rank() == 0 else [-1] * len(lst)
+    lst_tensor = torch.tensor(
+        lst, dtype=int, device=torch.cuda.current_device(), requires_grad=False
+    )
+    dist.broadcast(lst_tensor, src=0, async_op=False)
+    lst = lst(lst_tensor.cpu().numpy())
+
+    return lst
+
+
 class PartitionedParameterCoordinator:
     """Handles partitioning and gathering of parameters."""
 
@@ -244,6 +255,12 @@ class PartitionedParameterCoordinator:
         """indicate that we have completed one fwd+bwd for the model"""
         info_rank_0(f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}")
         if not self.__trace_complete:
+            # make sure that recorded parameter and submodule orders are
+            # identical across ranks
+            assert_ints_same_as_other_ranks([m.id for m in self.__submodule_order])
+            assert_ints_same_as_other_ranks([p[1].ds_id for p in self.__param_order])
+            assert_ints_same_as_other_ranks([p[0] for p in self.__param_order])
+
             self.__submodule_order = tuple(self.__submodule_order)  # freeze
             self.__param_order = tuple(self.__param_order)  # freeze
             self.__trace_complete = True
