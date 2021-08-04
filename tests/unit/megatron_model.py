@@ -1,3 +1,4 @@
+from pathlib import Path
 import torch
 import os
 import sys
@@ -18,8 +19,8 @@ def get_gpt2_model(args_others, mp_size=1):
     from megatron.initialize import initialize_megatron
 
     args_defaults = {
-        'vocab_file': 'tests/unit/gpt2-vocab.json',
-        'merge_file': 'tests/unit/gpt2-merges.txt',
+        'vocab_file': Path(__file__).parent / 'gpt2-vocab.json',
+        'merge_file': Path(__file__).parent / 'gpt2-merges.txt',
         'tokenizer_type': 'GPT2BPETokenizer',
     }
 
@@ -52,8 +53,8 @@ class GPT2ModelPipe(PipelineModule):
         from megatron.initialize import initialize_megatron
 
         args_defaults = {
-            'vocab_file': 'tests/unit/gpt2-vocab.json',
-            'merge_file': 'tests/unit/gpt2-merges.txt',
+            'vocab_file': Path(__file__).parent / 'gpt2-vocab.json',
+            'merge_file': Path(__file__).parent / 'gpt2-merges.txt',
             'tokenizer_type': 'GPT2BPETokenizer',
         }
 
