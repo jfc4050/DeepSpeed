@@ -617,6 +617,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # And only partitioned before the step
         param.ds_persist = False
 
+        param.is_external_param = False
+
         # The group that the parameter is scattered across.
         param.ds_process_group = self.ds_process_group
 

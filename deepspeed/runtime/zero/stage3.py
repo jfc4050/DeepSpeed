@@ -359,7 +359,7 @@ class PartitionedParameterCoordinator:
             # TODO. we should be able to have this as .remove().
             # figure out why submodule id isnt already in the set
             param.ds_active_sub_modules.discard(submodule.id)
-            if param.ds_id in params_to_release:
+            if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param)
 
     @instrument_w_nvtx
@@ -1359,6 +1359,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             for item in filter(lambda item: is_zero_param(item), output):
                 if not any(id(item) in m._external_params for m in FWD_MODULE_STACK):
+                    item.is_external_param = True
                     module_to_register = FWD_MODULE_STACK[-1]
                     print_rank_0(
                         f'Registering dangling parameter for module {module_to_register.__class__.__name__}.',
