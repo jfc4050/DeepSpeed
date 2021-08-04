@@ -1,12 +1,9 @@
 import torch
 import pytest
-import json
-import argparse
-import os
 import torch.distributed as dist
 
-from common import distributed_test
-from simple_model import SimpleModel, random_dataloader, args_from_dict
+from .common import distributed_test
+from .simple_model import SimpleModel, random_dataloader, args_from_dict
 
 import deepspeed
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint

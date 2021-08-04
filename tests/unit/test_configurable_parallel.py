@@ -1,16 +1,15 @@
 import torch
 import deepspeed
 import pytest
-import os
-import time
 import random
 import numpy as np
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from common import distributed_test
-from simple_model import args_from_dict, create_deepspeed_args
-from megatron_model import get_gpt2_model, get_megatron_version, GPT2ModelPipe
 from deepspeed.utils import RepeatingLoader
+
+from .common import distributed_test
+from .megatron_model import get_gpt2_model, get_megatron_version, GPT2ModelPipe
+from .simple_model import args_from_dict, create_deepspeed_args
 
 pytestmark = pytest.mark.skipif(
     torch.__version__ < '1.5',

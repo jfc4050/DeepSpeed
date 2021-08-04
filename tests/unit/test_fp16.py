@@ -1,13 +1,10 @@
 import torch
 import deepspeed
-import argparse
 import pytest
-import json
-import os
 from deepspeed.ops.adam import FusedAdam
-from common import distributed_test
-from simple_model import SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict, create_deepspeed_args
 from deepspeed.ops.op_builder import CPUAdamBuilder
+from .common import distributed_test
+from .simple_model import SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict, create_deepspeed_args
 
 try:
     from apex import amp

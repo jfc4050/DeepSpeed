@@ -1,20 +1,12 @@
-import argparse
 import numpy as np
 import torch
-import torch.nn.functional as F
 import pytest
-import json
 import random
-import time
 import copy
 from torch import nn
-from modelingpreln import BertEncoder as BertEncoderPreln
-from modeling import BertEncoder as BertEncoderPostln
-from modeling import BertLayerNorm, BertConfig
 from deepspeed import DeepSpeedTransformerLayer, DeepSpeedTransformerConfig
-import deepspeed
-
-import sys
+from .modeling import BertLayerNorm, BertConfig, BertEncoder as BertEncoderPostln
+from .modelingpreln import BertEncoder as BertEncoderPreln
 
 #if not deepspeed.ops.__installed_ops__['transformer']:
 #    pytest.skip("transformer kernels are not installed", allow_module_level=True)
