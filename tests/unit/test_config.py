@@ -1,4 +1,6 @@
 # A test on its own
+from pathlib import Path
+
 import torch
 import pytest
 import json
@@ -62,7 +64,7 @@ def test_batch_config(num_ranks, batch, micro_batch, gas, success):
         assert dist.get_world_size() == num_ranks, \
         'The test assumes a world size of f{num_ranks}'
 
-        ds_batch_config = 'tests/unit/ds_batch_config.json'
+        ds_batch_config = Path(__file__).parent / "ds_batch_config.json"
         ds_config = DeepSpeedConfig(ds_batch_config)
 
         #test cases when all parameters are provided
