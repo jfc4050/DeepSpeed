@@ -1,5 +1,6 @@
 import torch
 
+
 def instrument_w_nvtx(func):
     """decorator that causes an NVTX range to be recorded for the duration of the
     function call."""

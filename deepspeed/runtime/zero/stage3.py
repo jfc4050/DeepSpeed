@@ -53,6 +53,7 @@ def get_cuda_mem_allocated_str() -> str:
     # return f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f}GB"
     return "xGB"
 
+
 def input(msg):
     return
 
@@ -90,12 +91,15 @@ def get_all_parameters(sub_module, recurse=False):
     return itertools.chain(sub_module.named_parameters(recurse=recurse),
                            sub_module.ds_external_parameters())
 
+
 def iter_params(module: Module, recurse=False) -> Iterable[Parameter]:
     return map(lambda pair: pair[1], get_all_parameters(module, recurse))
+
 
 @functools.lru_cache(maxsize=None)
 def get_numel(module: Module) -> int:
     return sum(p.ds_numel for p in iter_params(module))
+
 
 #apply torch.autograd.Function that calls a backward_function to tensors in output
 def _apply_to_tensors_only(module, functional, backward_function, outputs):
@@ -181,9 +185,10 @@ def _inject_parameters(module, cls):
 
 def _get_lst_from_rank0(lst: List[int]) -> None:
     lst = lst if dist.get_rank() == 0 else [-1] * len(lst)
-    lst_tensor = torch.tensor(
-        lst, dtype=int, device=torch.cuda.current_device(), requires_grad=False
-    )
+    lst_tensor = torch.tensor(lst,
+                              dtype=int,
+                              device=torch.cuda.current_device(),
+                              requires_grad=False)
     dist.broadcast(lst_tensor, src=0, async_op=False)
     lst = lst(lst_tensor.cpu().numpy())
 
@@ -192,14 +197,17 @@ def _get_lst_from_rank0(lst: List[int]) -> None:
 
 class PartitionedParameterCoordinator:
     """Handles partitioning and gathering of parameters."""
-
     class __InflightParamRegistry(UserDict):
         """registry for parameters in flight"""
-        def __setitem__(self, param: Parameter, handle: AllGatherCoalescedHandle) -> None:
+        def __setitem__(self,
+                        param: Parameter,
+                        handle: AllGatherCoalescedHandle) -> None:
             if param in self.data:
                 raise RuntimeError(f"{param.ds_summary()} already in registry")
             if param.ds_status != ZeroParamStatus.INFLIGHT:
-                raise RuntimeError(f"attempted to add non-inflight parameter to registry {param.ds_summary()}")
+                raise RuntimeError(
+                    f"attempted to add non-inflight parameter to registry {param.ds_summary()}"
+                )
             self.data[param] = handle
 
     @dataclass
@@ -224,7 +232,8 @@ class PartitionedParameterCoordinator:
         # sequence of submodules/parameters in forward pass + backward pass
         self.__submodule_order: Iterable[Module] = []
         self.__param_order: Iterable[__class__.__ParamInTrace] = []
-        self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
+        self.__most_recent_step_id_param_fetched_for = collections.defaultdict(
+            lambda: int(-1e10))
         # number of available params, and max number of available params
         self.__n_available_params: int = 0
         self.__max_n_available_params: int = max_available_parameters_in_numel
@@ -252,8 +261,8 @@ class PartitionedParameterCoordinator:
             self.__submodule_order.append(sub_module)
             for param in sorted(set(iter_params(sub_module)), key=lambda p: p.ds_id):
                 self.__param_order.append(
-                    __class__.__ParamInTrace(param=param, step_id_last_used_at=self.__step_id)
-                )
+                    __class__.__ParamInTrace(param=param,
+                                             step_id_last_used_at=self.__step_id))
 
     def increment_step(self) -> None:
         """indicate that we have taken a step forward in the model"""
@@ -261,20 +270,23 @@ class PartitionedParameterCoordinator:
 
     def reset_step(self) -> None:
         """indicate that we have completed one fwd+bwd for the model"""
-        info_rank_0(f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}")
+        info_rank_0(
+            f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}")
         if not self.__trace_complete:
             # make sure that recorded parameter and submodule orders are
             # identical across ranks
             assert_ints_same_as_other_ranks([m.id for m in self.__submodule_order])
             assert_ints_same_as_other_ranks([p.param.ds_id for p in self.__param_order])
-            assert_ints_same_as_other_ranks([p.step_id_last_used_at for p in self.__param_order])
+            assert_ints_same_as_other_ranks(
+                [p.step_id_last_used_at for p in self.__param_order])
 
             self.__submodule_order = tuple(self.__submodule_order)  # freeze
             self.__param_order = tuple(self.__param_order)  # freeze
             self.__trace_complete = True
 
         self.__param_queue = collections.deque(self.__param_order)  # reset fetch queue
-        self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
+        self.__most_recent_step_id_param_fetched_for = collections.defaultdict(
+            lambda: int(-1e10))
         self.__step_id = 0
 
     """Fetch and Release
@@ -295,8 +307,7 @@ class PartitionedParameterCoordinator:
                 "queue_sz": f"{len(self.__param_queue or [])}",
                 "inflight": [p.ds_id for p in self.__inflight_param_registry],
                 "allocated": get_cuda_mem_allocated_str()
-            })
-        )
+            }))
 
         params_to_fetch = frozenset(iter_params(current_submodule))
         if self.__trace_complete:
@@ -305,10 +316,16 @@ class PartitionedParameterCoordinator:
             # if params have already been popped off the fetch queue by earlier
             # prefetches we won't look for them here
             discarded_from_prefetch_queue = set()
-            params_not_already_fetched = set(filter(lambda p: self.__most_recent_step_id_param_fetched_for[p] < self.__step_id, params_to_fetch))
-            while self.__param_queue and len(discarded_from_prefetch_queue) < len(params_not_already_fetched):
+            params_not_already_fetched = set(
+                filter(
+                    lambda p: self.__most_recent_step_id_param_fetched_for[p] < self.
+                    __step_id,
+                    params_to_fetch))
+            while self.__param_queue and len(discarded_from_prefetch_queue) < len(
+                    params_not_already_fetched):
                 param_in_trace = self.__param_queue.popleft()
-                self.__most_recent_step_id_param_fetched_for[param_in_trace.param] = param_in_trace.step_id_last_used_at
+                self.__most_recent_step_id_param_fetched_for[
+                    param_in_trace.param] = param_in_trace.step_id_last_used_at
                 discarded_from_prefetch_queue.add(param_in_trace.param)
             if discarded_from_prefetch_queue != params_not_already_fetched:
                 raise RuntimeError(
@@ -317,7 +334,9 @@ class PartitionedParameterCoordinator:
                     f"parameter fetch queue to be {tuple(p.ds_summary() for p in params_not_already_fetched)} "
                     f"but got {tuple(p.ds_summary() for p in discarded_from_prefetch_queue)}."
                 )
-            info_rank_0(f"-discarded from prefetch queue: {set(p.ds_id for p in discarded_from_prefetch_queue)}")
+            info_rank_0(
+                f"-discarded from prefetch queue: {set(p.ds_id for p in discarded_from_prefetch_queue)}"
+            )
 
         # kick off all gather for params in the immediately required submodule
         for param in params_to_fetch:
@@ -325,14 +344,19 @@ class PartitionedParameterCoordinator:
         self.__all_gather_params(params_to_fetch)
 
         # kick off all gather for params in the next few submodules (prefetch)
-        max_params_to_prefetch = min(self.__max_n_available_params - self.__n_available_params, self.__prefetch_bucket_sz)
+        max_params_to_prefetch = min(
+            self.__max_n_available_params - self.__n_available_params,
+            self.__prefetch_bucket_sz)
         params_to_prefetch = set()
-        while self.__param_queue and sum(p.ds_numel for p in params_to_prefetch) < max_params_to_prefetch:
+        while self.__param_queue and sum(
+                p.ds_numel for p in params_to_prefetch) < max_params_to_prefetch:
             param_in_trace = self.__param_queue.popleft()
-            self.__most_recent_step_id_param_fetched_for[param_in_trace.param] = param_in_trace.step_id_last_used_at
+            self.__most_recent_step_id_param_fetched_for[
+                param_in_trace.param] = param_in_trace.step_id_last_used_at
             params_to_prefetch.add(param_in_trace.param)
         for param in params_to_prefetch:
-            info_rank_0(f"-prefetch: {param.ds_summary()}, {get_cuda_mem_allocated_str()}")
+            info_rank_0(
+                f"-prefetch: {param.ds_summary()}, {get_cuda_mem_allocated_str()}")
         self.__all_gather_params(params_to_prefetch)
 
         if self.__prefetch_nvme:
@@ -350,10 +374,10 @@ class PartitionedParameterCoordinator:
     def release_sub_module(self, submodule: Module) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
-        params_to_release = (
-            self.__params_to_release(submodule, self.__step_id)
-            if self.__trace_complete else set(p.ds_id for p in iter_params(submodule))
-        )
+        params_to_release = (self.__params_to_release(submodule,
+                                                      self.__step_id)
+                             if self.__trace_complete else set(
+                                 p.ds_id for p in iter_params(submodule)))
 
         for param in iter_params(submodule):
             # TODO. we should be able to have this as .remove().
@@ -393,17 +417,22 @@ class PartitionedParameterCoordinator:
     def __release_param(self, param: Parameter) -> None:
         mem_before = get_cuda_mem_allocated_str()
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
-            info_rank_0(f"-release: {param.ds_summary()}, {mem_before} -> {get_cuda_mem_allocated_str()}")
+            info_rank_0(
+                f"-release: {param.ds_summary()}, {mem_before} -> {get_cuda_mem_allocated_str()}"
+            )
             param.partition()
             self.__n_available_params -= param.ds_numel
 
     @instrument_w_nvtx
     @functools.lru_cache(maxsize=None)
-    def __params_to_release(self, submodule_to_release: Module, step_id: int) -> Set[int]:
+    def __params_to_release(self,
+                            submodule_to_release: Module,
+                            step_id: int) -> Set[int]:
         if not self.__trace_complete:
             raise RuntimeError("expected trace to be complete")
 
-        params_to_release = set(p.ds_id for p in iter_params(submodule_to_release) if not p.ds_persist)
+        params_to_release = set(p.ds_id for p in iter_params(submodule_to_release)
+                                if not p.ds_persist)
 
         # examine all modules within `max_reuse_dist_in_numel` of the current step,
         # if we see any of the candidate parameters to be released reoccur while
@@ -429,11 +458,10 @@ class PartitionedParameterCoordinator:
         swap_in_params = []
         for _, param in self.__param_queue:
             if param.nvme_swapper is None:
-                raise RuntimeError(f"expected param {param.ds_summary()} to have nvme swapper")
-            if (
-                numel_considered > 2 * numel_in_flight or
-                len(swap_in_params) >= param.nvme_swapper.available_swap_in_buffers()
-            ):
+                raise RuntimeError(
+                    f"expected param {param.ds_summary()} to have nvme swapper")
+            if (numel_considered > 2 * numel_in_flight or len(swap_in_params) >=
+                    param.nvme_swapper.available_swap_in_buffers()):
                 break
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
                 swap_in_params.append(param)
@@ -2583,8 +2611,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.optimizer_swapper.swap_out_optimizer_state(
             parameter=self.fp32_partitioned_groups_flat[sub_group_id],
-            async_swap=self.next_swappable_fp32_partitioned_groups[sub_group_id] is
-            not None)
+            async_swap=self.next_swappable_fp32_partitioned_groups[sub_group_id]
+            is not None)
 
         self.stop_timers([OPTIMIZER_SWAP_OUT_STATE])
         see_memory_usage(
@@ -2865,7 +2893,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
         self.param_coordinator.reset_step()
-
         '''Partitioning Parameters that were not partitioned
         Usually if parameters of modules whose input parameters do not require
         grad computation do not trigger post call and will therefore will remain unpartitioned '''

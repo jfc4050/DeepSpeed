@@ -50,7 +50,6 @@ def is_zero_supported_optimizer(optimizer):
     return type(optimizer) in ZERO_SUPPORTED_OPTIMIZERS
 
 
-
 @instrument_w_nvtx
 def _assert_same_as_other_ranks(items: list) -> None:
     """
@@ -65,10 +64,8 @@ def _assert_same_as_other_ranks(items: list) -> None:
     rank0_items = items if dist.get_rank() == 0 else [None for _ in items]
     dist.broadcast_object_list(rank0_items, src=0)
     if items != rank0_items:
-        raise RuntimeError(
-            f"disagreement between rank0 and rank{dist.get_rank()}: "
-            f"rank0: {rank0_items}, rank{dist.get_rank()}: {items}"
-        )
+        raise RuntimeError(f"disagreement between rank0 and rank{dist.get_rank()}: "
+                           f"rank0: {rank0_items}, rank{dist.get_rank()}: {items}")
 
 
 def get_lst_from_rank0(lst: List[int]) -> None:
@@ -99,7 +96,5 @@ def assert_ints_same_as_other_ranks(ints: List[int]) -> None:
     """
     rank0_ints = get_lst_from_rank0(ints)
     if ints != rank0_ints:
-        raise RuntimeError(
-            f"disagreement between rank0 and rank{dist.get_rank()}: "
-            f"rank0: {rank0_ints}, rank{dist.get_rank()}: {ints}"
-        )
+        raise RuntimeError(f"disagreement between rank0 and rank{dist.get_rank()}: "
+                           f"rank0: {rank0_ints}, rank{dist.get_rank()}: {ints}")
