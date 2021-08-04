@@ -3,6 +3,7 @@
 Licensed under the MIT license.
 """
 
+from dataclasses import dataclass
 import functools
 import os
 import collections
@@ -192,7 +193,7 @@ def _get_lst_from_rank0(lst: List[int]) -> None:
 class PartitionedParameterCoordinator:
     """Handles partitioning and gathering of parameters."""
 
-    class InflightParamRegistry(UserDict):
+    class __InflightParamRegistry(UserDict):
         """registry for parameters in flight"""
         def __setitem__(self, param: Parameter, handle: AllGatherCoalescedHandle) -> None:
             if param in self.data:
@@ -200,6 +201,11 @@ class PartitionedParameterCoordinator:
             if param.ds_status != ZeroParamStatus.INFLIGHT:
                 raise RuntimeError(f"attempted to add non-inflight parameter to registry {param.ds_summary()}")
             self.data[param] = handle
+
+    @dataclass
+    class __ParamInTrace:
+        param: Parameter
+        step_id_last_used_at: int
 
     def __init__(
         self,
@@ -209,27 +215,27 @@ class PartitionedParameterCoordinator:
         prefetch_nvme: bool = False,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
-        self.__inflight_param_registry = PartitionedParameterCoordinator.InflightParamRegistry()
+        self.__inflight_param_registry = __class__.__InflightParamRegistry()
         # keeps track of the number of submodules invoked so far.
-        self.__step_id = 0
+        self.__step_id: int = 0
         # whether or not we have completed a trace of the entire network. This should
         # always be true after the first forward pass + backward pass.
-        self.__trace_complete = False
+        self.__trace_complete: bool = False
         # sequence of submodules/parameters in forward pass + backward pass
-        self.__submodule_order = []
-        self.__param_order = []
+        self.__submodule_order: Iterable[Module] = []
+        self.__param_order: Iterable[__class__.__ParamInTrace] = []
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
         # number of available params, and max number of available params
-        self.__n_available_params = 0
-        self.__max_n_available_params = max_available_parameters_in_numel
+        self.__n_available_params: int = 0
+        self.__max_n_available_params: int = max_available_parameters_in_numel
         # max distance between two use of the module beyond which module is released
-        self.__max_reuse_dist_in_numel = max_reuse_distance_in_numel
+        self.__max_reuse_dist_in_numel: int = max_reuse_distance_in_numel
         # queue for parameters to fetch. parameters will be popped off the left
         # side of the dequeue as they are fetched
-        self.__param_queue = None
-        self.__prefetch_bucket_sz = prefetch_bucket_sz
-        self.__prefetch_nvme = prefetch_nvme
-        self.hierarchy = 0
+        self.__param_queue: Iterable[__class__.__ParamInTrace] = None
+        self.__prefetch_bucket_sz: int = prefetch_bucket_sz
+        self.__prefetch_nvme: bool = prefetch_nvme
+        self.hierarchy: int = 0
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -245,7 +251,9 @@ class PartitionedParameterCoordinator:
         if not self.__trace_complete:
             self.__submodule_order.append(sub_module)
             for param in sorted(set(iter_params(sub_module)), key=lambda p: p.ds_id):
-                self.__param_order.append((self.__step_id, param))
+                self.__param_order.append(
+                    __class__.__ParamInTrace(param=param, step_id_last_used_at=self.__step_id)
+                )
 
     def increment_step(self) -> None:
         """indicate that we have taken a step forward in the model"""
@@ -258,8 +266,8 @@ class PartitionedParameterCoordinator:
             # make sure that recorded parameter and submodule orders are
             # identical across ranks
             assert_ints_same_as_other_ranks([m.id for m in self.__submodule_order])
-            assert_ints_same_as_other_ranks([p[1].ds_id for p in self.__param_order])
-            assert_ints_same_as_other_ranks([p[0] for p in self.__param_order])
+            assert_ints_same_as_other_ranks([p.param.ds_id for p in self.__param_order])
+            assert_ints_same_as_other_ranks([p.step_id_last_used_at for p in self.__param_order])
 
             self.__submodule_order = tuple(self.__submodule_order)  # freeze
             self.__param_order = tuple(self.__param_order)  # freeze
@@ -299,9 +307,9 @@ class PartitionedParameterCoordinator:
             discarded_from_prefetch_queue = set()
             params_not_already_fetched = set(filter(lambda p: self.__most_recent_step_id_param_fetched_for[p] < self.__step_id, params_to_fetch))
             while self.__param_queue and len(discarded_from_prefetch_queue) < len(params_not_already_fetched):
-                step_id_for_param, param = self.__param_queue.popleft()
-                self.__most_recent_step_id_param_fetched_for[param] = step_id_for_param
-                discarded_from_prefetch_queue.add(param)
+                param_in_trace = self.__param_queue.popleft()
+                self.__most_recent_step_id_param_fetched_for[param_in_trace.param] = param_in_trace.step_id_last_used_at
+                discarded_from_prefetch_queue.add(param_in_trace.param)
             if discarded_from_prefetch_queue != params_not_already_fetched:
                 raise RuntimeError(
                     f"tracing error at step {self.__step_id}: "
@@ -320,9 +328,9 @@ class PartitionedParameterCoordinator:
         max_params_to_prefetch = min(self.__max_n_available_params - self.__n_available_params, self.__prefetch_bucket_sz)
         params_to_prefetch = set()
         while self.__param_queue and sum(p.ds_numel for p in params_to_prefetch) < max_params_to_prefetch:
-            step_id_for_param, param = self.__param_queue.popleft()
-            self.__most_recent_step_id_param_fetched_for[param] = step_id_for_param
-            params_to_prefetch.add(param)
+            param_in_trace = self.__param_queue.popleft()
+            self.__most_recent_step_id_param_fetched_for[param_in_trace.param] = param_in_trace.step_id_last_used_at
+            params_to_prefetch.add(param_in_trace.param)
         for param in params_to_prefetch:
             info_rank_0(f"-prefetch: {param.ds_summary()}, {get_cuda_mem_allocated_str()}")
         self.__all_gather_params(params_to_prefetch)
