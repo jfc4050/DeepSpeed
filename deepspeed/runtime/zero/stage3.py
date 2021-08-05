@@ -216,11 +216,11 @@ class PartitionedParameterCoordinator:
         step_id_last_used_at: int
 
     def __init__(
-        self,
-        prefetch_bucket_sz: int,
-        max_reuse_distance_in_numel: int,
-        max_available_parameters_in_numel: int,
-        prefetch_nvme: bool = False,
+            self,
+            prefetch_bucket_sz: int,
+            max_reuse_distance_in_numel: int,
+            max_available_parameters_in_numel: int,
+            prefetch_nvme: bool = False,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
         self.__inflight_param_registry = __class__.__InflightParamRegistry()
@@ -245,6 +245,8 @@ class PartitionedParameterCoordinator:
         self.__prefetch_bucket_sz: int = prefetch_bucket_sz
         self.__prefetch_nvme: bool = prefetch_nvme
         self.hierarchy: int = 0
+
+        dist.barrier()
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -1324,6 +1326,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
 
+        def _pre_forward_hook(_, *args) -> None:
+            """makes sure all ranks start .forward() at the same time so that we
+            don't accidentally mix allgathers for different steps/sets of parameters
+            """
+            dist.barrier()
+
         #reset step if in inference mode
         @instrument_w_nvtx
         def _end_of_forward_hook(module, *args):
@@ -1331,6 +1339,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self.param_coordinator.reset_step()
 
         #likely one of them should be enough but just to be safe
+        self.module.register_forward_pre_hook(_pre_forward_hook)
         self._register_hooks_recursively(self.module)
         self.module.register_forward_hook(_end_of_forward_hook)
 
@@ -2611,8 +2620,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.optimizer_swapper.swap_out_optimizer_state(
             parameter=self.fp32_partitioned_groups_flat[sub_group_id],
-            async_swap=self.next_swappable_fp32_partitioned_groups[sub_group_id]
-            is not None)
+            async_swap=self.next_swappable_fp32_partitioned_groups[sub_group_id] is
+            not None)
 
         self.stop_timers([OPTIMIZER_SWAP_OUT_STATE])
         see_memory_usage(
