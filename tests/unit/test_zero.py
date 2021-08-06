@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Set
 import pytest
 import torch.distributed as dist
 import torch
@@ -252,9 +252,10 @@ def _print_with_rank(msg: str) -> None:
     print(f"RANK{dist.get_rank()}: {msg}")
 
 
-def _assert_fully_partitioned(model: Module) -> None:
+def _assert_partition_status(model: Module,
+                             valid_statuses: Set[ZeroParamStatus]) -> None:
     for _, param in model.named_parameters():
-        assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+        assert param.ds_status in valid_statuses, param.ds_summary()
 
 
 def _assert_fully_available(model: Module) -> None:
@@ -289,24 +290,50 @@ class EltwiseMultiplicationTestNetwork(Module):
 
         self.loss = L1Loss(reduction="none")
 
-    def forward(self, x: Tensor, y: Tensor) -> Dict[str, Tensor]:
-        _assert_fully_partitioned(self)
+    def forward(self, x: Tensor, y: Tensor, prefetching: bool) -> Dict[str, Tensor]:
+        _assert_partition_status(
+            self,
+            {
+                ZeroParamStatus.NOT_AVAILABLE,
+                ZeroParamStatus.INFLIGHT,
+                ZeroParamStatus.AVAILABLE
+            } if prefetching else {ZeroParamStatus.NOT_AVAILABLE})
 
-        _assert_fully_partitioned(self.__layer1)
+        _assert_partition_status(
+            self.__layer1,
+            {ZeroParamStatus.INFLIGHT if prefetching else ZeroParamStatus.NOT_AVAILABLE})
         hidden1 = self.__layer1(x)
-        _assert_fully_partitioned(self.__layer1)
+        _assert_partition_status(self.__layer1, {ZeroParamStatus.NOT_AVAILABLE})
 
-        _assert_fully_partitioned(self.__layer2)
+        _assert_partition_status(self.__layer2,
+                                 {
+                                     ZeroParamStatus.AVAILABLE
+                                     if prefetching else ZeroParamStatus.NOT_AVAILABLE
+                                 })
         hidden2 = self.__layer2(hidden1)
-        _assert_fully_partitioned(self.__layer2)
+        _assert_partition_status(self.__layer2, {ZeroParamStatus.NOT_AVAILABLE})
 
-        _assert_fully_partitioned(self.__layer3)
+        _assert_partition_status(self.__layer3,
+                                 {
+                                     ZeroParamStatus.AVAILABLE
+                                     if prefetching else ZeroParamStatus.NOT_AVAILABLE
+                                 })
         y_hat = self.__layer3(hidden2)
-        _assert_fully_partitioned(self.__layer3)
+        _assert_partition_status(self.__layer3,
+                                 {
+                                     ZeroParamStatus.AVAILABLE
+                                     if prefetching else ZeroParamStatus.NOT_AVAILABLE
+                                 })
 
         loss = self.loss(y_hat, y)
 
-        _assert_fully_partitioned(self)
+        _assert_partition_status(
+            self,
+            {
+                ZeroParamStatus.NOT_AVAILABLE,
+                ZeroParamStatus.INFLIGHT,
+                ZeroParamStatus.AVAILABLE
+            } if prefetching else {ZeroParamStatus.NOT_AVAILABLE})
 
         return {
             "hidden1": hidden1,
@@ -316,7 +343,15 @@ class EltwiseMultiplicationTestNetwork(Module):
         }
 
 
-def test_zero3_param_partitioning_no_persistence():
+@pytest.mark.parametrize("param_persistence_threshold", [0, 10])
+# TODO. fails for some reason when not using contiguous gradients
+@pytest.mark.parametrize("contiguous_gradients", [True])
+@pytest.mark.parametrize("overlap_comm", [True, False])
+def test_zero3_param_partitioning(
+        param_persistence_threshold: int,
+        contiguous_gradients: bool,
+        overlap_comm: bool,
+) -> None:
     @distributed_test(world_size=[2])
     def _test_zero3_param_partitioning():
         m = 3
@@ -335,11 +370,13 @@ def test_zero3_param_partitioning_no_persistence():
                 "train_micro_batch_size_per_gpu": 1,
                 "zero_optimization": {
                     "stage": 3,
-                    "stage3_param_persistence_threshold": 0
+                    "stage3_max_reuse_distance": 0,
+                    "stage3_param_persistence_threshold": param_persistence_threshold,
+                    "contiguous_gradients": contiguous_gradients,
+                    "overlap_comm": overlap_comm,
                 },
-                "zero_allow_untested_optimizer": True,
                 "optimizer": {
-                    "type": "SGD",
+                    "type": "Adam",
                     "params": {
                         "lr": 1.
                     }
@@ -353,19 +390,79 @@ def test_zero3_param_partitioning_no_persistence():
             weight.ds_tensor.data = torch.full_like(weight.ds_tensor.data,
                                                     (i + 1) * (1 + dist.get_rank()))
 
-        _print_with_rank({
-            name: param.ds_tensor
-            for name,
-            param in ds_engine.module.named_parameters()
-        })
-
         def create_tensor(vals):
             return torch.as_tensor(vals, dtype=torch.float16, device=ds_engine.device)
 
-        ### iteration 0
-        _assert_fully_partitioned(ds_engine)
+        expected_hidden1 = create_tensor([
+            [1,
+             1,
+             1,
+             1,
+             1],
+            [1,
+             1,
+             1,
+             2,
+             2],
+            [2,
+             2,
+             2,
+             2,
+             2],
+        ])
+        expected_hidden2 = create_tensor([
+            [2,
+             2,
+             2,
+             2,
+             2],
+            [2,
+             2,
+             2,
+             8,
+             8],
+            [8,
+             8,
+             8,
+             8,
+             8],
+        ])
+        expected_yhat = create_tensor([[6,
+                                        6,
+                                        6,
+                                        6,
+                                        6],
+                                       [6,
+                                        6,
+                                        6,
+                                        48,
+                                        48],
+                                       [48,
+                                        48,
+                                        48,
+                                        48,
+                                        48]])
+        expected_loss = create_tensor([
+            [5,
+             5,
+             5,
+             5,
+             5],
+            [5,
+             5,
+             5,
+             47,
+             47],
+            [47,
+             47,
+             47,
+             47,
+             47],
+        ])
 
-        activations = ds_engine(
+        ### iteration 0
+        _assert_partition_status(ds_engine, {ZeroParamStatus.NOT_AVAILABLE})
+        activations_step_0 = ds_engine(
             x=torch.ones((m,
                           n),
                          dtype=torch.float16,
@@ -374,90 +471,57 @@ def test_zero3_param_partitioning_no_persistence():
                           n),
                          dtype=torch.float16,
                          device=ds_engine.device),
+            prefetching=False,
         )
-        assert torch.allclose(
-            activations["hidden1"],
-            create_tensor([
-                [1,
-                 1,
-                 1,
-                 1,
-                 1],
-                [1,
-                 1,
-                 1,
-                 2,
-                 2],
-                [2,
-                 2,
-                 2,
-                 2,
-                 2],
-            ],
-                          ),
-        )
-        assert torch.allclose(
-            activations["hidden2"],
-            create_tensor([
-                [2,
-                 2,
-                 2,
-                 2,
-                 2],
-                [2,
-                 2,
-                 2,
-                 8,
-                 8],
-                [8,
-                 8,
-                 8,
-                 8,
-                 8],
-            ],
-                          ),
-        )
-        assert torch.allclose(
-            activations["y_hat"],
-            create_tensor([[6,
-                            6,
-                            6,
-                            6,
-                            6],
-                           [6,
-                            6,
-                            6,
-                            48,
-                            48],
-                           [48,
-                            48,
-                            48,
-                            48,
-                            48]],
-                          ))
-        assert torch.allclose(
-            activations["loss"],
-            create_tensor([
-                [5,
-                 5,
-                 5,
-                 5,
-                 5],
-                [5,
-                 5,
-                 5,
-                 47,
-                 47],
-                [47,
-                 47,
-                 47,
-                 47,
-                 47],
-            ],
-                          ))
+        assert torch.allclose(activations_step_0["hidden1"], expected_hidden1)
+        assert torch.allclose(activations_step_0["hidden2"], expected_hidden2)
+        assert torch.allclose(activations_step_0["y_hat"], expected_yhat)
+        assert torch.allclose(activations_step_0["loss"], expected_loss)
 
-        ds_engine.backward(activations["loss"].sum())
-        _assert_fully_partitioned(ds_engine)
+        ds_engine.backward(activations_step_0["loss"].sum())
+        _assert_partition_status(ds_engine, {ZeroParamStatus.NOT_AVAILABLE})
+
+        avgd_gradients = ds_engine.optimizer.averaged_gradients
+        assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
+        weight_gradients: List[Tensor] = avgd_gradients[0]
+
+        dloss_wrt_layer1, dloss_wrt_layer2, dloss_wrt_layer3 = weight_gradients
+        # dloss_wrt_layer1 = layer3 * layer2 * x
+        # dloss_wrt_layer2 = layer3 * hidden1
+        # dloss_wrt_layer3 = hidden2
+        if dist.get_rank() == 0:
+            assert torch.allclose(dloss_wrt_layer1, create_tensor([6] * 8))
+            assert torch.allclose(dloss_wrt_layer2, create_tensor([3] * 8))
+            assert torch.allclose(dloss_wrt_layer3, create_tensor([2] * 8))
+        elif dist.get_rank() == 1:
+            # parameters dont split evenly across ranks so rank 1 has a zero-padded
+            # partition
+            assert torch.allclose(dloss_wrt_layer1, create_tensor(([24] * 7) + [0]))
+            assert torch.allclose(dloss_wrt_layer2, create_tensor(([12] * 7) + [0]))
+            assert torch.allclose(dloss_wrt_layer3, create_tensor(([8] * 7) + [0]))
+        else:
+            raise RuntimeError("test has world size of two")
+
+        ### iteration 1
+        _assert_partition_status(ds_engine, {ZeroParamStatus.NOT_AVAILABLE})
+        activations_step1 = ds_engine(
+            x=torch.ones((m,
+                          n),
+                         dtype=torch.float16,
+                         device=ds_engine.device),
+            y=torch.ones((m,
+                          n),
+                         dtype=torch.float16,
+                         device=ds_engine.device),
+            prefetching=True,
+        )
+        assert torch.allclose(activations_step1["hidden1"], expected_hidden1)
+        assert torch.allclose(activations_step1["hidden2"], expected_hidden2)
+        assert torch.allclose(activations_step1["y_hat"], expected_yhat)
+        assert torch.allclose(activations_step1["loss"], expected_loss)
+
+        ds_engine.backward(activations_step1["loss"].sum())
+        _assert_partition_status(ds_engine, {ZeroParamStatus.NOT_AVAILABLE})
 
         avgd_gradients = ds_engine.optimizer.averaged_gradients
         assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
