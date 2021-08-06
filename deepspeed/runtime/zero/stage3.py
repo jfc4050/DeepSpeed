@@ -241,7 +241,7 @@ class PartitionedParameterCoordinator:
         self.__max_reuse_dist_in_numel: int = max_reuse_distance_in_numel
         # queue for parameters to fetch. parameters will be popped off the left
         # side of the dequeue as they are fetched
-        self.__param_queue: Iterable[__class__.__ParamInTrace] = None
+        self.__param_queue: collections.deque = None
         self.__prefetch_bucket_sz: int = prefetch_bucket_sz
         self.__prefetch_nvme: bool = prefetch_nvme
         self.hierarchy: int = 0
@@ -311,55 +311,58 @@ class PartitionedParameterCoordinator:
                 "allocated": get_cuda_mem_allocated_str()
             }))
 
-        params_to_fetch = frozenset(iter_params(current_submodule))
-        if self.__trace_complete:
-            # go through the parameters we need for the current module and pop them
-            # off the fetch queue so that they aren't prefetched later.
-            # if params have already been popped off the fetch queue by earlier
-            # prefetches we won't look for them here
-            discarded_from_prefetch_queue = set()
-            params_not_already_fetched = set(
-                filter(
-                    lambda p: self.__most_recent_step_id_param_fetched_for[p] < self.
-                    __step_id,
-                    params_to_fetch))
-            while self.__param_queue and len(discarded_from_prefetch_queue) < len(
-                    params_not_already_fetched):
-                param_in_trace = self.__param_queue.popleft()
+        with torch.cuda.nvtx.range("fetch_kickoff"):
+            params_to_fetch = frozenset(iter_params(current_submodule))
+            if self.__trace_complete:
+                # go through the parameters we need for the current module and pop them
+                # off the fetch queue so that they aren't prefetched later.
+                # if params have already been popped off the fetch queue by earlier
+                # prefetches we won't look for them here
+                discarded_from_prefetch_queue = set()
+                params_not_already_fetched = set(
+                    filter(
+                        lambda p: self.__most_recent_step_id_param_fetched_for[p] < self.
+                        __step_id,
+                        params_to_fetch))
+                while self.__param_queue and len(discarded_from_prefetch_queue) < len(
+                        params_not_already_fetched):
+                    param_in_trace = self.__param_queue.popleft()
+                    self.__most_recent_step_id_param_fetched_for[
+                        param_in_trace.param] = param_in_trace.step_id_last_used_at
+                    discarded_from_prefetch_queue.add(param_in_trace.param)
+                if discarded_from_prefetch_queue != params_not_already_fetched:
+                    raise RuntimeError(
+                        f"tracing error at step {self.__step_id}: "
+                        f"expected the next {len(params_not_already_fetched)} parameters in the "
+                        f"parameter fetch queue to be {tuple(p.ds_summary() for p in params_not_already_fetched)} "
+                        f"but got {tuple(p.ds_summary() for p in discarded_from_prefetch_queue)}."
+                    )
+                info_rank_0(
+                    f"-discarded from prefetch queue: {set(p.ds_id for p in discarded_from_prefetch_queue)}"
+                )
+            # kick off all gather for params in the immediately required submodule
+            for param in params_to_fetch:
+                info_rank_0(f"-fetch: {param.ds_summary()}")
+            with torch.cuda.nvtx.range("fetch"):
+                self.__all_gather_params(params_to_fetch)
+
+        with torch.cuda.nvtx.range("prefetch_kickoff"):
+            # kick off all gather for params in the next few submodules (prefetch)
+            max_params_to_prefetch = min(
+                self.__max_n_available_params - self.__n_available_params,
+                self.__prefetch_bucket_sz)
+            params_to_prefetch = set()
+            numel_prefetching = 0
+            while self.__param_queue and numel_prefetching < max_params_to_prefetch:
+                param_in_trace: __class__.__ParamInTrace = self.__param_queue.popleft()
                 self.__most_recent_step_id_param_fetched_for[
                     param_in_trace.param] = param_in_trace.step_id_last_used_at
-                discarded_from_prefetch_queue.add(param_in_trace.param)
-            if discarded_from_prefetch_queue != params_not_already_fetched:
-                raise RuntimeError(
-                    f"tracing error at step {self.__step_id}: "
-                    f"expected the next {len(params_not_already_fetched)} parameters in the "
-                    f"parameter fetch queue to be {tuple(p.ds_summary() for p in params_not_already_fetched)} "
-                    f"but got {tuple(p.ds_summary() for p in discarded_from_prefetch_queue)}."
-                )
-            info_rank_0(
-                f"-discarded from prefetch queue: {set(p.ds_id for p in discarded_from_prefetch_queue)}"
-            )
-
-        # kick off all gather for params in the immediately required submodule
-        for param in params_to_fetch:
-            info_rank_0(f"-fetch: {param.ds_summary()}, {get_cuda_mem_allocated_str()}")
-        self.__all_gather_params(params_to_fetch)
-
-        # kick off all gather for params in the next few submodules (prefetch)
-        max_params_to_prefetch = min(
-            self.__max_n_available_params - self.__n_available_params,
-            self.__prefetch_bucket_sz)
-        params_to_prefetch = set()
-        while self.__param_queue and sum(
-                p.ds_numel for p in params_to_prefetch) < max_params_to_prefetch:
-            param_in_trace = self.__param_queue.popleft()
-            self.__most_recent_step_id_param_fetched_for[
-                param_in_trace.param] = param_in_trace.step_id_last_used_at
-            params_to_prefetch.add(param_in_trace.param)
-        for param in params_to_prefetch:
-            info_rank_0(
-                f"-prefetch: {param.ds_summary()}, {get_cuda_mem_allocated_str()}")
-        self.__all_gather_params(params_to_prefetch)
+                if param_in_trace.param not in params_to_prefetch:
+                    params_to_prefetch.add(param_in_trace.param)
+                    numel_prefetching += param_in_trace.param.ds_numel
+            for param in params_to_prefetch:
+                info_rank_0(f"-prefetch: {param.ds_summary()}")
+            self.__all_gather_params(params_to_prefetch)
 
         if self.__prefetch_nvme:
             self.__prefetch_nvme_param_partitions()
