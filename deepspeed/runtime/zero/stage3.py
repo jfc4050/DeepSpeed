@@ -1326,6 +1326,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
 
+        @instrument_w_nvtx
         def _pre_forward_hook(_, *args) -> None:
             """makes sure all ranks start .forward() at the same time so that we
             don't accidentally mix allgathers for different steps/sets of parameters
@@ -1415,7 +1416,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             self.post_sub_module_forward_function(module)
 
+        @instrument_w_nvtx
         def _pre_backward_module_hook(module, inputs, output):
+            @instrument_w_nvtx
             def _run_before_backward_function(sub_module):
                 # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
                 # before doing backwards, so each backward will need a pre-fetch - using reference
@@ -1454,9 +1457,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 _run_after_backward_hook,
                 inputs)
 
+        @instrument_w_nvtx
         def _post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
 
+            @instrument_w_nvtx
             def _run_after_backward_function(sub_module):
                 if sub_module.ds_grads_remaining == 0:
                     self.post_sub_module_backward_function(sub_module)
@@ -1680,6 +1685,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         param_group,
                         partition_id)
 
+    @instrument_w_nvtx
     def independent_gradient_partition_epilogue(self):
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         self.reduce_ipg_grads()
@@ -1806,6 +1812,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         param_tmp = param.expand_as(param)
                         grad_acc = param_tmp.grad_fn.next_functions[0][0]
 
+                        @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
                             self.reduce_ready_partitions_and_remove_grads(param, i)
 
@@ -1831,6 +1838,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             force=False)
 
     ###############Idependent Partition Gradient ########################
+    @instrument_w_nvtx
     def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
         #print_rank_0(f"Inside reduce ipg buckets. {debug_param2name_id_shape(param)}, ipg elements {self.elements_in_ipg_bucket}, reduce bucket size {self.reduce_bucket_size}", force=True)
 
@@ -2011,6 +2019,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return total_norm
 
+    @instrument_w_nvtx
     def partition_previous_reduced_grads(self):
         if not self.previous_reduced_grads:
             return
@@ -2116,6 +2125,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.previous_reduced_grads = []
 
+    @instrument_w_nvtx
     def reduce_ipg_grads(self, extra_param=None):
         if self.overlap_comm:
             self.reduction_stream.synchronize()
@@ -2149,6 +2159,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.elements_in_ipg_bucket = 0
         #####################################################################
 
+    @instrument_w_nvtx
     def reduce_ready_partitions_and_remove_grads(self, param, i):
         #print_rank_0(f"Backward {debug_param2name_id_shape(param)}", force=True)
         self.reduce_independent_p_g_buckets_and_remove_grads(param, i)

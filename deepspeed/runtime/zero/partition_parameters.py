@@ -351,12 +351,12 @@ class InsertPostInitMethodToModuleSubClasses(object):
 
 class AllGatherCoalescedHandle:
     def __init__(
-        self,
-        handle,
-        params: list,
-        partitions: list,
-        world_size: int,
-        comm_stream: Stream,
+            self,
+            handle,
+            params: list,
+            partitions: list,
+            world_size: int,
+            comm_stream: Stream,
     ) -> None:
         self.__handle = handle
         self.__params = params
@@ -722,6 +722,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param_list = [cls]
             self._partition(param_list, has_been_updated=has_been_updated)
 
+        @instrument_w_nvtx
         def reduce_gradients_at_owner(param_list=None, hierarchy=0):
             cls = param
             if param_list is None:
@@ -731,6 +732,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             )
             self._reduce_scatter_gradients(param_list)
 
+        @instrument_w_nvtx
         def partition_gradients(param_list=None,
                                 partition_buffers=None,
                                 hierarchy=0,
@@ -1093,6 +1095,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         return None
 
+    @instrument_w_nvtx
     def _reduce_scatter_gradients(self, param_list):
         #print_rank_0([param.grad for param in param_list])
         #assert any([param.grad is None for param in param_list]), "None gradients cannot be reduce scattered"
@@ -1165,6 +1168,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         return handle, input_list[rank]
 
+    @instrument_w_nvtx
     def _partition_gradients(self, param_list, partition_buffers=None, accumulate=False):
         if partition_buffers is None:
             partition_buffers = [None] * len(param_list)
