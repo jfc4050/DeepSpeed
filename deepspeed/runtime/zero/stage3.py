@@ -228,7 +228,7 @@ class PartitionedParameterCoordinator:
         self.__step_id: int = 0
         # whether or not we have completed a trace of the entire network. This should
         # always be true after the first forward pass + backward pass.
-        self.__trace_complete: bool = False
+        self.trace_complete: bool = False
         # sequence of submodules/parameters in forward pass + backward pass
         self.__submodule_order: Iterable[Module] = []
         self.__param_order: Iterable[__class__.__ParamInTrace] = []
@@ -259,12 +259,15 @@ class PartitionedParameterCoordinator:
 
     def record_trace(self, sub_module: Module) -> None:
         """adds sub module to trace"""
-        if not self.__trace_complete:
-            self.__submodule_order.append(sub_module)
-            for param in sorted(set(iter_params(sub_module)), key=lambda p: p.ds_id):
-                self.__param_order.append(
-                    __class__.__ParamInTrace(param=param,
-                                             step_id_last_used_at=self.__step_id))
+        if self.trace_complete:
+            raise RuntimeError(
+                "attemted to record trace when trace was already complete")
+
+        self.__submodule_order.append(sub_module)
+        for param in sorted(set(iter_params(sub_module)), key=lambda p: p.ds_id):
+            self.__param_order.append(
+                __class__.__ParamInTrace(param=param,
+                                         step_id_last_used_at=self.__step_id))
 
     def increment_step(self) -> None:
         """indicate that we have taken a step forward in the model"""
@@ -274,7 +277,7 @@ class PartitionedParameterCoordinator:
         """indicate that we have completed one fwd+bwd for the model"""
         info_rank_0(
             f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}")
-        if not self.__trace_complete:
+        if not self.trace_complete:
             # make sure that recorded parameter and submodule orders are
             # identical across ranks
             assert_ints_same_as_other_ranks([m.id for m in self.__submodule_order])
@@ -284,7 +287,7 @@ class PartitionedParameterCoordinator:
 
             self.__submodule_order = tuple(self.__submodule_order)  # freeze
             self.__param_order = tuple(self.__param_order)  # freeze
-            self.__trace_complete = True
+            self.trace_complete = True
 
         self.__param_queue = collections.deque(self.__param_order)  # reset fetch queue
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(
@@ -313,7 +316,7 @@ class PartitionedParameterCoordinator:
 
         with torch.cuda.nvtx.range("fetch_kickoff"):
             params_to_fetch = frozenset(iter_params(current_submodule))
-            if self.__trace_complete:
+            if self.trace_complete:
                 # go through the parameters we need for the current module and pop them
                 # off the fetch queue so that they aren't prefetched later.
                 # if params have already been popped off the fetch queue by earlier
@@ -372,7 +375,7 @@ class PartitionedParameterCoordinator:
             param.ds_active_sub_modules.add(current_submodule.id)
             if param in self.__inflight_param_registry:
                 self.__inflight_param_registry.pop(param).wait()
-            info_rank_0(f"-wait: {param.ds_summary()} {get_cuda_mem_allocated_str()}")
+            info_rank_0(f"-wait: {param.ds_summary()}")
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
 
     @instrument_w_nvtx
@@ -381,7 +384,7 @@ class PartitionedParameterCoordinator:
         be released."""
         params_to_release = (self.__params_to_release(submodule,
                                                       self.__step_id)
-                             if self.__trace_complete else set(
+                             if self.trace_complete else set(
                                  p.ds_id for p in iter_params(submodule)))
 
         for param in iter_params(submodule):
@@ -433,7 +436,7 @@ class PartitionedParameterCoordinator:
     def __params_to_release(self,
                             submodule_to_release: Module,
                             step_id: int) -> Set[int]:
-        if not self.__trace_complete:
+        if not self.trace_complete:
             raise RuntimeError("expected trace to be complete")
 
         params_to_release = set(p.ds_id for p in iter_params(submodule_to_release)
@@ -1366,7 +1369,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             force=False)
         return persistent_params
 
-    def _register_hooks_recursively(self, module, count=[0]):
+    def _register_hooks_recursively(self, module: Module, count=[0]) -> None:
         my_count = count[0]
         module.id = my_count
 
@@ -1494,9 +1497,16 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(sub_module)
 
-        self.param_coordinator.record_trace(sub_module)
+        if not self.param_coordinator.trace_complete:
+            self.param_coordinator.record_trace(sub_module)
 
         self.param_coordinator.fetch_sub_module(sub_module)
+
+        for param in iter_params(sub_module):
+            if param.ds_status != ZeroParamStatus.AVAILABLE:
+                raise RuntimeError(
+                    f"expected param {param.ds_summary()} to be available")
+
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
@@ -1517,8 +1527,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def pre_sub_module_backward_function(self, sub_module):
-        self.param_coordinator.record_trace(sub_module)
+        if not self.param_coordinator.trace_complete:
+            self.param_coordinator.record_trace(sub_module)
+
         self.param_coordinator.fetch_sub_module(sub_module)
+        for param in iter_params(sub_module):
+            if param.ds_status != ZeroParamStatus.AVAILABLE:
+                raise RuntimeError(
+                    f"expected param {param.ds_summary()} to be available")
+
         self.param_coordinator.increment_step()
 
     @instrument_w_nvtx
