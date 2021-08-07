@@ -1377,9 +1377,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             count[0] = count[0] + 1
             self._register_hooks_recursively(child, count=count)
 
+        @instrument_w_nvtx
         def _pre_forward_module_hook(module, *args):
             self.pre_sub_module_forward_function(module)
 
+        @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
             global FWD_MODULE_STACK
             FWD_MODULE_STACK.pop()
@@ -2440,6 +2442,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     # creates a flat fused tensor from the tensor list starting at the first_offset
     # in the first tensor of the list. If there are not enough elements in the tensor
     # list then the flat tensor will be padded with zeros
+    @instrument_w_nvtx
     def get_flat_partition(self,
                            tensor_list,
                            first_offset,
@@ -2600,6 +2603,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                          force=False)
 
     # create a flat tensor aligned at the alignment boundary
+    @instrument_w_nvtx
     def flatten_dense_tensors_aligned(self, tensor_list, alignment):
         num_elements = 0
         for tens in tensor_list:
@@ -2830,6 +2834,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     return True
         return False
 
+    @instrument_w_nvtx
     def has_overflow(self, partition_gradients=True):
         if partition_gradients:
             if self.overlap_comm:
