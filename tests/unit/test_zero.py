@@ -492,20 +492,29 @@ def test_zero3_param_partitioning_base(
             assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
             weight_gradients: List[Tensor] = avgd_gradients[0]
 
+            # FIXME: flaky failures on [fp16, overlap, contiguous, persist_thresh]
+            # A [False-True-True-10]
+            #   this appears to be from erroneously fetching layer3 instead of layer2
+            # B [False-False-True-0]
             dloss_wrt_layer1, dloss_wrt_layer2, dloss_wrt_layer3 = weight_gradients
-            # dloss_wrt_layer1 = layer3 * layer2 * x
-            # dloss_wrt_layer2 = layer3 * hidden1
             # dloss_wrt_layer3 = hidden2
+            # dloss_wrt_layer2 = layer3 * hidden1
+            # dloss_wrt_layer1 = layer3 * layer2 * x
             if dist.get_rank() == 0:
                 assert torch.allclose(dloss_wrt_layer3, create_tensor([2] * 8))
-                assert torch.allclose(dloss_wrt_layer2, create_tensor([3] * 8))
-                assert torch.allclose(dloss_wrt_layer1, create_tensor([6] * 8))
+                # FIXME: flaky failure B - get 2.5
+                assert torch.allclose(dloss_wrt_layer2, create_tensor([3 * 1] * 8))
+                # FIXME: flaky failure A - get 9
+                assert torch.allclose(dloss_wrt_layer1, create_tensor([3 * 2 * 1] * 8))
             elif dist.get_rank() == 1:
                 # parameters dont split evenly across ranks so rank 1 has a zero-padded
                 # partition
                 assert torch.allclose(dloss_wrt_layer3, create_tensor(([8] * 7) + [0]))
-                assert torch.allclose(dloss_wrt_layer2, create_tensor(([12] * 7) + [0]))
-                assert torch.allclose(dloss_wrt_layer1, create_tensor(([24] * 7) + [0]))
+                assert torch.allclose(dloss_wrt_layer2,
+                                      create_tensor(([6 * 2] * 7) + [0]))
+                # FIXME: flaky failure A - get 36
+                assert torch.allclose(dloss_wrt_layer1,
+                                      create_tensor(([6 * 4 * 1] * 7) + [0]))
             else:
                 raise RuntimeError("test has world size of two")
 
@@ -650,5 +659,16 @@ def test_zero3_param_partitioning_many_params(world_sz, param_sz, n_layers):
             for layer_num, activation in enumerate(activations):
                 expected_activations *= 2 * layer_num
                 assert torch.allclose(activation, expected_activations)
+
+            # TODO. finish writing this test
+            ds_engine.backward(activations[-1].sum())
+            _assert_partition_status(ds_engine, {ZeroParamStatus.NOT_AVAILABLE})
+
+            avgd_gradients = ds_engine.optimizer.averaged_gradients
+            assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
+            weight_gradients: List[Tensor] = avgd_gradients[0]
+
+            for layer_num, activation in enumerate(weight_gradients):
+                pass
 
     _distributed_test()
