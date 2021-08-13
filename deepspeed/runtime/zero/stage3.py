@@ -16,7 +16,6 @@ from torch.nn import Module, Parameter
 import torch.distributed as dist
 import math
 from torch._six import inf
-from torch.autograd import Variable
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -269,14 +268,11 @@ class PartitionedParameterCoordinator:
                 __class__.__ParamInTrace(param=param,
                                          step_id_last_used_at=self.__step_id))
 
-    def increment_step(self) -> None:
-        """indicate that we have taken a step forward in the model"""
-        self.__step_id += 1
-
     def reset_step(self) -> None:
         """indicate that we have completed one fwd+bwd for the model"""
-        info_rank_0(
-            f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}")
+        print_rank_0(
+            f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}",
+            force=True)
         if not self.trace_complete:
             # make sure that recorded parameter and submodule orders are
             # identical across ranks
@@ -378,6 +374,8 @@ class PartitionedParameterCoordinator:
             info_rank_0(f"-wait: {param.ds_summary()}")
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
 
+        self.__step_id += 1
+
     @instrument_w_nvtx
     def release_sub_module(self, submodule: Module) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
@@ -390,7 +388,7 @@ class PartitionedParameterCoordinator:
         for param in iter_params(submodule):
             # TODO. we should be able to have this as .remove().
             # figure out why submodule id isnt already in the set
-            param.ds_active_sub_modules.discard(submodule.id)
+            param.ds_active_sub_modules.remove(submodule.id)
             if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param)
 
@@ -1336,6 +1334,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             """makes sure all ranks start .forward() at the same time so that we
             don't accidentally mix allgathers for different steps/sets of parameters
             """
+            torch.cuda.synchronize()
             dist.barrier()
 
         #reset step if in inference mode
@@ -1499,28 +1498,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         if not self.param_coordinator.trace_complete:
             self.param_coordinator.record_trace(sub_module)
-
         self.param_coordinator.fetch_sub_module(sub_module)
-
-        for param in iter_params(sub_module):
-            if param.ds_status != ZeroParamStatus.AVAILABLE:
-                raise RuntimeError(
-                    f"expected param {param.ds_summary()} to be available")
-
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
-
-        self.param_coordinator.increment_step()
 
     @instrument_w_nvtx
     def post_sub_module_forward_function(self, sub_module):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
             force=False)
-
         self.param_coordinator.release_sub_module(sub_module)
-
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
             force=False)
@@ -1529,14 +1517,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def pre_sub_module_backward_function(self, sub_module):
         if not self.param_coordinator.trace_complete:
             self.param_coordinator.record_trace(sub_module)
-
         self.param_coordinator.fetch_sub_module(sub_module)
-        for param in iter_params(sub_module):
-            if param.ds_status != ZeroParamStatus.AVAILABLE:
-                raise RuntimeError(
-                    f"expected param {param.ds_summary()} to be available")
-
-        self.param_coordinator.increment_step()
 
     @instrument_w_nvtx
     def post_sub_module_backward_function(self, sub_module):
