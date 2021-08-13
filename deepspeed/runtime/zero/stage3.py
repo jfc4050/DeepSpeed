@@ -182,18 +182,6 @@ def _inject_parameters(module, cls):
         module._parameters = new_param
 
 
-def _get_lst_from_rank0(lst: List[int]) -> None:
-    lst = lst if dist.get_rank() == 0 else [-1] * len(lst)
-    lst_tensor = torch.tensor(lst,
-                              dtype=int,
-                              device=torch.cuda.current_device(),
-                              requires_grad=False)
-    dist.broadcast(lst_tensor, src=0, async_op=False)
-    lst = lst(lst_tensor.cpu().numpy())
-
-    return lst
-
-
 class PartitionedParameterCoordinator:
     """Handles partitioning and gathering of parameters."""
     class __InflightParamRegistry(UserDict):
