@@ -557,8 +557,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 self._convert_to_deepspeed_param(param)
                 param.partition()
 
-        # cuda stream used for deallocating memory
-        self.dealloc_stream = Stream()
         self.comm_stream = Stream()
 
     def _validate_remote_device(self, remote_device, ds_config):
@@ -868,12 +866,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #if torch.distributed.get_rank():
             #    print(f"Releasing {param.data.numel()}")
             if param.ds_tensor is not None and not has_been_updated:
-
                 #param.data = param.ds_tensor.data
-                with torch.cuda.stream(self.dealloc_stream):
-                    see_memory_usage(f"before partitioning {param.ds_summary()}")
-                    free_param(param)
-                    see_memory_usage(f"after partitioning {param.ds_summary()}")
+                see_memory_usage(f"before partitioning {param.ds_summary()}")
+                free_param(param)
+                see_memory_usage(f"after partitioning {param.ds_summary()}")
 
                 if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
                     print_rank_0(
