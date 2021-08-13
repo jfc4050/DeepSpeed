@@ -557,7 +557,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 self._convert_to_deepspeed_param(param)
                 param.partition()
 
-        self.comm_stream = Stream()
+        # FIXME: figure out why we are getting race conditions when this is not
+        # same as default stream - somewhere we are not properly synchronizing streams
+        self.comm_stream = torch.cuda.current_stream()
 
     def _validate_remote_device(self, remote_device, ds_config):
         if ds_config is not None:
