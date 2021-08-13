@@ -1966,14 +1966,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             elif self._has_inf_or_nan(param.grad.data):
                 self.local_overflow = True
 
-    def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param, fp32_grad_tensor):
-        with torch.cuda.stream(self.copy_grad_stream):
-            param_id = self.get_param_id(param)
-            src_tensor = param.grad.view(-1).float()
-            #print(f"src_tensor {src_tensor.size()} and fp32 grad {fp32_grad_tensor.size()}")
-            fp32_grad_tensor.copy_(src_tensor, non_blocking=True)
-            param.grad = None
-
     def complete_grad_norm_calculation_for_cpu_offload(self, params):
         total_norm = 0.0
         norm_type = 2.0
@@ -2053,9 +2045,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 if self.offload_optimizer:
                     param.partition_gradients(
                         partition_buffers=self.temp_grad_gpu_buffer)
-                    #with torch.cuda.stream(self.copy_grad_stream):
-                    #    self.reduction_stream.synchronize()
-
                     if self.gradient_accumulation_steps > 1:
                         # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
                         fp16_grad_tensor = self.grads_in_partition[i].narrow(
@@ -2081,14 +2070,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                             param.grad = None
                             offload_fp32_offsets[i].append(dest_offset)
                         else:
+                            # copy grad from GPU to fp32 buffer
                             fp32_grad_tensor = self.fp32_partitioned_groups_flat[
                                 i].grad.narrow(0,
                                                dest_offset,
                                                num_elements)
-
-                            self.async_inplace_copy_grad_to_fp32_buffer_from_gpu(
-                                param,
-                                fp32_grad_tensor)
+                            fp32_grad_tensor.copy_(param.grad.view(-1).float(),
+                                                   non_blocking=True)
+                            param.grad = None
                 else:
                     # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
                     fp16_grad_tensor = self.grads_in_partition[i].narrow(
