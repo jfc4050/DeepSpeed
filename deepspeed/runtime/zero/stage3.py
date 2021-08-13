@@ -1892,25 +1892,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return tensor
 
-    def average_tensor(self, tensors, params_to_reduce):
-        with torch.cuda.stream(self.reduction_stream):
-            if not self.reduce_scatter:
-                for tensor in tensors:
-                    self.gradient_reduction_w_predivide(tensor)
-                return
-
-            for tensor in tensors:
-                tensor.div_(dist.get_world_size(group=self.dp_process_group))
-
-            # reduction resulting with each rank only holding the gradient partition it owns
-            # This could either be a reduce scatter or a reduce op depending on how
-            # parameters are partitionied. The method is implemented by the
-            # DeepSpeed param extensions to the pytorch parameter, so its up to
-            # the extension to define what happens here
-            params_to_reduce[0].reduce_gradients_at_owner(
-                param_list=params_to_reduce,
-                hierarchy=self.param_coordinator.hierarchy)
-
     def set_grad_positions(self):
         for i, group in enumerate(self.fp16_groups):
             current_offset = 0
@@ -2114,12 +2095,41 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             if self.extra_large_param_to_reduce is not None:
                 reduction_list.append(self.extra_large_param_to_reduce.grad)
                 self.extra_large_param_to_reduce = None
-            self.average_tensor(reduction_list, params_to_reduce)
+
+            with torch.cuda.stream(self.reduction_stream):
+                if not self.reduce_scatter:
+                    for tensor in reduction_list:
+                        self.gradient_reduction_w_predivide(tensor)
+                    return
+
+                for tensor in reduction_list:
+                    tensor.div_(dist.get_world_size(group=self.dp_process_group))
+
+                # reduction resulting with each rank only holding the gradient partition it owns
+                # This could either be a reduce scatter or a reduce op depending on how
+                # parameters are partitionied. The method is implemented by the
+                # DeepSpeed param extensions to the pytorch parameter, so its up to
+                # the extension to define what happens here
+                params_to_reduce[0].reduce_gradients_at_owner(
+                    param_list=params_to_reduce,
+                    hierarchy=self.param_coordinator.hierarchy)
         else:
-            self.buffered_reduce_fallback(
-                None,
-                self.grads_in_ipg_bucket,
-                elements_per_buffer=self.elements_in_ipg_bucket)
+            # buffered reduce fallback
+            split_buckets = split_half_float_double(self.grads_in_ipg_bucket)
+
+            for bucket in split_buckets:
+                # allreduce no retain
+                with torch.cuda.stream(self.reduction_stream):
+                    small_bucket = []
+                    numel = 0
+                    for tensor in bucket:
+                        small_bucket.append(tensor)
+                        numel = numel + tensor.numel()
+                        if numel > self.elements_in_ipg_bucket:
+                            self.__allreduce_and_copy(small_bucket, rank=None, log=None)
+                            small_bucket = []
+                    if len(small_bucket) > 0:
+                        self.__allreduce_and_copy(small_bucket, rank=None, log=None)
 
         for _, param, param_id in self.params_in_ipg_bucket:
             self.params_already_reduced[param_id] = True
@@ -2232,42 +2242,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return tensor
 
     # if rank is specified do a reduction instead of an allreduce
-    def allreduce_and_copy(self, small_bucket, rank=None, log=None):
-        with torch.cuda.stream(self.reduction_stream):
-            allreduced = self.allreduce_bucket(small_bucket, rank=rank, log=log)
-            if rank is None or rank == dist.get_rank(group=self.dp_process_group):
-                for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
-                    buf.copy_(synced)
-
-    def allreduce_no_retain(self,
-                            bucket,
-                            numel_per_bucket=500000000,
-                            rank=None,
-                            log=None):
-        small_bucket = []
-        numel = 0
-        for tensor in bucket:
-            small_bucket.append(tensor)
-            numel = numel + tensor.numel()
-            if numel > numel_per_bucket:
-                self.allreduce_and_copy(small_bucket, rank=rank, log=None)
-                small_bucket = []
-        if len(small_bucket) > 0:
-            self.allreduce_and_copy(small_bucket, rank=rank, log=log)
-
-    # allows using reduction of gradients instead of using all_reduce
-    def buffered_reduce_fallback(self,
-                                 rank,
-                                 grads,
-                                 elements_per_buffer=500000000,
-                                 log=None):
-        split_buckets = split_half_float_double(grads)
-
-        for i, bucket in enumerate(split_buckets):
-            self.allreduce_no_retain(bucket,
-                                     numel_per_bucket=elements_per_buffer,
-                                     rank=rank,
-                                     log=log)
+    def __allreduce_and_copy(self, small_bucket, rank=None, log=None):
+        allreduced = self.allreduce_bucket(small_bucket, rank=rank, log=log)
+        if rank is None or rank == dist.get_rank(group=self.dp_process_group):
+            for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
+                buf.copy_(synced)
 
     #############################################################################
     #############################################################################
