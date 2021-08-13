@@ -1380,7 +1380,18 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         @instrument_w_nvtx
         def _pre_forward_module_hook(module, *args):
-            self.pre_sub_module_forward_function(module)
+            see_memory_usage(f"Before sub module function {module.__class__.__name__}",
+                             force=False)
+
+            global FWD_MODULE_STACK
+            FWD_MODULE_STACK.append(module)
+
+            if not self.param_coordinator.trace_complete:
+                self.param_coordinator.record_trace(module)
+            self.param_coordinator.fetch_sub_module(module)
+            see_memory_usage(
+                f"Before sub module function {module.__class__.__name__} after fetch",
+                force=False)
 
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
@@ -1420,7 +1431,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                     item.all_gather()
 
-            self.post_sub_module_forward_function(module)
+            see_memory_usage(
+                f"After sub module function {module.__class__.__name__} {module.id} before release",
+                force=False)
+            self.param_coordinator.release_sub_module(module)
+            see_memory_usage(
+                f"After sub module function {module.__class__.__name__}  {module.id} after release",
+                force=False)
 
         @instrument_w_nvtx
         def _pre_backward_module_hook(module, inputs, output):
@@ -1431,7 +1448,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 # counting to support this scenario
                 #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
                 if sub_module.applied_pre_backward_ref_cnt > 0:
-                    self.pre_sub_module_backward_function(sub_module)
+                    if not self.param_coordinator.trace_complete:
+                        self.param_coordinator.record_trace(sub_module)
+                    self.param_coordinator.fetch_sub_module(sub_module)
                     sub_module.applied_pre_backward_ref_cnt -= 1
                 #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
 
@@ -1445,13 +1464,16 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         def _alternate_post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
 
-            #print(f"Before Forward {module.__class__.__name__}")
-
             def _run_after_backward_hook(*unused):
                 module.ds_grads_remaining = module.ds_grads_remaining - 1
                 if module.ds_grads_remaining == 0:
-                    #print(f"After backward {module.__class__.__name__}")
-                    self.post_sub_module_backward_function(module)
+                    see_memory_usage(
+                        f"After sub module backward function {module.__class__.__name__} {module.id} before release",
+                        force=False)
+                    self.param_coordinator.release_sub_module(module)
+                    see_memory_usage(
+                        f"After sub module backward function {module.__class__.__name__} {module.id} after release",
+                        force=False)
 
             def _run_before_forward_function(input):
                 if input.requires_grad:
@@ -1470,64 +1492,23 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             @instrument_w_nvtx
             def _run_after_backward_function(sub_module):
                 if sub_module.ds_grads_remaining == 0:
-                    self.post_sub_module_backward_function(sub_module)
+                    see_memory_usage(
+                        f"After sub module backward function {module.__class__.__name__} {module.id} before release",
+                        force=False)
+                    self.param_coordinator.release_sub_module(module)
+                    see_memory_usage(
+                        f"After sub module backward function {module.__class__.__name__} {module.id} after release",
+                        force=False)
 
             return _apply_to_tensors_only(module,
                                           PostBackwardFunction,
                                           _run_after_backward_function,
                                           inputs)
 
-        # Pre forward hook
         module.register_forward_pre_hook(_pre_forward_module_hook)
-        # Post forward hook
         module.register_forward_hook(_post_forward_module_hook)
-
-        # Pre backward hook
         module.register_forward_hook(_pre_backward_module_hook)
-
-        # post backward hook
         module.register_forward_pre_hook(_post_backward_module_hook)
-
-    @instrument_w_nvtx
-    def pre_sub_module_forward_function(self, sub_module):
-        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}",
-                         force=False)
-
-        global FWD_MODULE_STACK
-        FWD_MODULE_STACK.append(sub_module)
-
-        if not self.param_coordinator.trace_complete:
-            self.param_coordinator.record_trace(sub_module)
-        self.param_coordinator.fetch_sub_module(sub_module)
-        see_memory_usage(
-            f"Before sub module function {sub_module.__class__.__name__} after fetch",
-            force=False)
-
-    @instrument_w_nvtx
-    def post_sub_module_forward_function(self, sub_module):
-        see_memory_usage(
-            f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
-            force=False)
-        self.param_coordinator.release_sub_module(sub_module)
-        see_memory_usage(
-            f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
-            force=False)
-
-    @instrument_w_nvtx
-    def pre_sub_module_backward_function(self, sub_module):
-        if not self.param_coordinator.trace_complete:
-            self.param_coordinator.record_trace(sub_module)
-        self.param_coordinator.fetch_sub_module(sub_module)
-
-    @instrument_w_nvtx
-    def post_sub_module_backward_function(self, sub_module):
-        see_memory_usage(
-            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} before release",
-            force=False)
-        self.param_coordinator.release_sub_module(sub_module)
-        see_memory_usage(
-            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} after release",
-            force=False)
 
     def _release_ipg_buffers(self):
         if self.contiguous_gradients:
