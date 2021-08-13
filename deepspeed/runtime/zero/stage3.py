@@ -1662,7 +1662,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         partition_id)
 
     @instrument_w_nvtx
-    def independent_gradient_partition_epilogue(self):
+    def overlapping_partition_gradients_reduce_epilogue(self):
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         self.reduce_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
@@ -1698,6 +1698,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self._release_ipg_buffers()
 
         see_memory_usage(f"End ipg_epilogue", force=False)
+
+        self.zero_grad()
 
     # resets all partition to no reduced
     # sets remianing grads to the total number of grads in each partition
@@ -1767,10 +1769,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self.grad_start_offset[i][partition_id][param_id] = first_offset
 
             current_index = current_index + param_size
-
-    def overlapping_partition_gradients_reduce_epilogue(self):
-        self.independent_gradient_partition_epilogue()
-        self.zero_grad()
 
     def create_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
