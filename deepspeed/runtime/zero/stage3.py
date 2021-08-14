@@ -56,20 +56,6 @@ def input(msg):
     return
 
 
-def split_half_float_double(tensors):
-    dtypes = [
-        "torch.cuda.HalfTensor",
-        "torch.cuda.FloatTensor",
-        "torch.cuda.DoubleTensor"
-    ]
-    buckets = []
-    for i, dtype in enumerate(dtypes):
-        bucket = [t for t in tensors if t.type() == dtype]
-        if bucket:
-            buckets.append(bucket)
-    return buckets
-
-
 def move_to_cpu(tensor_list):
     for tensor in tensor_list:
         tensor.data = tensor.data.cpu()
@@ -1505,7 +1491,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
-        self.reduce_ipg_grads()
+        with torch.cuda.stream(self.reduction_stream):
+            self.__reduce_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
         if self.overlap_comm:
@@ -1599,7 +1586,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
 
-            self.reduce_ipg_grads()
+            with torch.cuda.stream(self.reduction_stream):
+                self.__reduce_ipg_grads()
 
             if self.contiguous_gradients and self.overlap_comm:
                 # Swap ipg_index between 0 and 1
@@ -1844,14 +1832,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.previous_reduced_grads = []
 
     @instrument_w_nvtx
-    def reduce_ipg_grads(self, extra_param=None):
+    def __reduce_ipg_grads(self) -> None:
         if self.overlap_comm:
-            self.reduction_stream.synchronize()
+            self.reduction_stream.synchronize()  # TODO. is this still needed?
 
-        with torch.cuda.stream(self.reduction_stream):
-            self.partition_previous_reduced_grads()
+        self.partition_previous_reduced_grads()
 
-        params_to_reduce = [param for i, param, param_id in self.params_in_ipg_bucket]
+        params_to_reduce = [param for _, param, _ in self.params_in_ipg_bucket]
         #print(f"Params in ipg bucket {self.params_in_ipg_bucket}")
         #print(f"Reducing {[(debug_param2name_id_shape(param), param.grad) for param in params_to_reduce]}")
         #exit(0)
@@ -1861,42 +1848,40 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 reduction_list.append(self.extra_large_param_to_reduce.grad)
                 self.extra_large_param_to_reduce = None
 
-            with torch.cuda.stream(self.reduction_stream):
-                if not self.reduce_scatter:
-                    for tensor in reduction_list:
-                        self.gradient_reduction_w_predivide(tensor)
-                    return
-
+            if not self.reduce_scatter:
                 for tensor in reduction_list:
-                    tensor.div_(dist.get_world_size(group=self.dp_process_group))
+                    self.gradient_reduction_w_predivide(tensor)
+                return
 
-                # reduction resulting with each rank only holding the gradient partition it owns
-                # This could either be a reduce scatter or a reduce op depending on how
-                # parameters are partitionied. The method is implemented by the
-                # DeepSpeed param extensions to the pytorch parameter, so its up to
-                # the extension to define what happens here
-                params_to_reduce[0].reduce_gradients_at_owner(
-                    param_list=params_to_reduce,
-                    hierarchy=self.param_coordinator.hierarchy)
+            for tensor in reduction_list:
+                tensor.div_(dist.get_world_size(group=self.dp_process_group))
+
+            # reduction resulting with each rank only holding the gradient partition it owns
+            # This could either be a reduce scatter or a reduce op depending on how
+            # parameters are partitionied. The method is implemented by the
+            # DeepSpeed param extensions to the pytorch parameter, so its up to
+            # the extension to define what happens here
+            params_to_reduce[0].reduce_gradients_at_owner(
+                param_list=params_to_reduce,
+                hierarchy=self.param_coordinator.hierarchy)
         else:
-            # buffered reduce fallback
-            split_buckets = split_half_float_double(self.grads_in_ipg_bucket)
+            for dtype in {f"torch.cuda.{p}Tensor" for p in ["Half", "Float", "Double"]}:
+                bucket = [t for t in self.grads_in_ipg_bucket if t.type() == dtype]
+                if not bucket:
+                    continue
 
-            for bucket in split_buckets:
-                # allreduce no retain
-                with torch.cuda.stream(self.reduction_stream):
-                    small_bucket = []
-                    numel = 0
-                    for tensor in bucket:
-                        small_bucket.append(tensor)
-                        numel = numel + tensor.numel()
-                        if numel > self.elements_in_ipg_bucket:
-                            self.__allreduce_and_copy(small_bucket, rank=None, log=None)
-                            small_bucket = []
-                    if len(small_bucket) > 0:
+                small_bucket = []
+                numel = 0
+                for tensor in bucket:
+                    small_bucket.append(tensor)
+                    numel = numel + tensor.numel()
+                    if numel > self.elements_in_ipg_bucket:
                         self.__allreduce_and_copy(small_bucket, rank=None, log=None)
+                        small_bucket = []
+                if len(small_bucket) > 0:
+                    self.__allreduce_and_copy(small_bucket, rank=None, log=None)
 
-        for _, param, param_id in self.params_in_ipg_bucket:
+        for _, _, param_id in self.params_in_ipg_bucket:
             self.params_already_reduced[param_id] = True
 
         self.previous_reduced_grads = params_to_reduce
