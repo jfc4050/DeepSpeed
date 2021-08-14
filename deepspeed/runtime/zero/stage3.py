@@ -837,7 +837,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.averaged_gradients = {}
 
         #creates backward hooks for gradient partitioning
-        self.__init_reduce_and_remove_grad_hooks()
+        self.create_reduce_and_remove_grad_hooks()
 
         #exit(0)
 
@@ -1758,62 +1758,35 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             current_index = current_index + param_size
 
-    def __init_reduce_and_remove_grad_hooks(self):
+    def create_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
         self.grad_accs = []
-        for param_group_idx, param_group in enumerate(self.fp16_groups):
-            param: Parameter
+        for i, param_group in enumerate(self.fp16_groups):
             for param in param_group:
-                if not param.requires_grad:
-                    continue
-                param.all_gather()  # hook must be created in un-partitioned parameter
+                if param.requires_grad:
+                    #print_rank_0(f" Before all gather {param.device}, {param.shape}")
 
-                @instrument_w_nvtx
-                def reduce_partition_and_remove_grads(*_):
-                    # Because the ipg bucket is initialized with a random place holder tensor, we must
-                    # explicitly check that the bucket has any real data in it (self.elements_in_ipg_bucket >
-                    # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
-                    # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
-                    # empty, while reduction_list will have that garbage data.
-                    if self.elements_in_ipg_bucket > 0 and self.elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
-                        self.report_ipg_memory_usage("before reduce_ipg_grads",
-                                                     param.ds_numel)
-                        self.reduce_ipg_grads()
-                        if self.contiguous_gradients and self.overlap_comm:
-                            # Swap ipg_index between 0 and 1
-                            self.ipg_index = 1 - self.ipg_index
-                        self.report_ipg_memory_usage("after reduce_ipg_grads",
-                                                     param.ds_numel)
+                    # The hook must be created in un-partitioned parameter
+                    param.all_gather()
 
-                    param_id = self.get_param_id(param)
-                    assert self.params_already_reduced[param_id] == False, \
-                        f"The parameter {param_id} has already been reduced. \
-                        Gradient computed twice for this partition. \
-                        Multiple gradient reduction is currently not supported"
+                    #print(f"After all gather {param.device}, {param.shape}")
+                    def wrapper(param, i):
+                        param_tmp = param.expand_as(param)
+                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
 
-                    # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
-                    if param.ds_numel > self.reduce_bucket_size:
-                        self.extra_large_param_to_reduce = param
-                    elif self.contiguous_gradients:
-                        #print_rank_0("before new grad tensor move")
-                        new_grad_tensor = self.ipg_buffer[self.ipg_index].narrow(
-                            0,
-                            self.elements_in_ipg_bucket,
-                            param.ds_numel)
-                        #print_rank_0("after new grad tensor move")
-                        new_grad_tensor.copy_(param.grad.view(-1))
-                        param.grad.data = new_grad_tensor.data.view_as(param.grad)
+                        @instrument_w_nvtx
+                        def reduce_partition_and_remove_grads(*notneeded):
+                            self.reduce_ready_partitions_and_remove_grads(param, i)
 
-                    self.elements_in_ipg_bucket += param.ds_numel
-                    self.grads_in_ipg_bucket.append(param.grad)
-                    self.params_in_ipg_bucket.append((param_group_idx, param, param_id))
-                    self.report_ipg_memory_usage("End ipg_remove_grads", 0)
+                        grad_acc.register_hook(reduce_partition_and_remove_grads)
+                        self.grad_accs.append(grad_acc)
 
-                grad_acc = param.expand_as(param).grad_fn.next_functions[0][0]
-                grad_acc.register_hook(reduce_partition_and_remove_grads)
-                self.grad_accs.append(grad_acc)
+                    #print(f"param grad fn {param.expand_as(param).grad_fn}")
+                    wrapper(param, i)
 
-                param.partition()  # re-partition parameter after creating the hook
+                    # Partition the parameter after creating the hook
+                    param.partition()
+        print_rank_0(f'[End] Create gradient reduction hooks')
 
     def get_param_id(self, param):
         unique_id = id(param)
@@ -1827,6 +1800,52 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             force=False)
 
     ###############Idependent Partition Gradient ########################
+    @instrument_w_nvtx
+    def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
+        #print_rank_0(f"Inside reduce ipg buckets. {debug_param2name_id_shape(param)}, ipg elements {self.elements_in_ipg_bucket}, reduce bucket size {self.reduce_bucket_size}", force=True)
+
+        # Because the ipg bucket is initialized with a random place holder tensor, we must
+        # explicitly check that the bucket has any real data in it (self.elements_in_ipg_bucket >
+        # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
+        # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
+        # empty, while reduction_list will have that garbage data.
+        if self.elements_in_ipg_bucket > 0 and self.elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
+            self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
+                                         param.ds_numel)
+
+            self.reduce_ipg_grads()
+
+            if self.contiguous_gradients and self.overlap_comm:
+                # Swap ipg_index between 0 and 1
+                self.ipg_index = 1 - self.ipg_index
+            self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads",
+                                         param.ds_numel)
+
+        param_id = self.get_param_id(param)
+        assert self.params_already_reduced[param_id] == False, \
+            f"The parameter {param_id} has already been reduced. \
+            Gradient computed twice for this partition. \
+            Multiple gradient reduction is currently not supported"
+
+        # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
+        if param.ds_numel > self.reduce_bucket_size:
+            self.extra_large_param_to_reduce = param
+
+        elif self.contiguous_gradients:
+            #print_rank_0("before new grad tensor move")
+            new_grad_tensor = self.ipg_buffer[self.ipg_index].narrow(
+                0,
+                self.elements_in_ipg_bucket,
+                param.ds_numel)
+            #print_rank_0("after new grad tensor move")
+            new_grad_tensor.copy_(param.grad.view(-1))
+            param.grad.data = new_grad_tensor.data.view_as(param.grad)
+
+        self.elements_in_ipg_bucket += param.ds_numel
+        self.grads_in_ipg_bucket.append(param.grad)
+        self.params_in_ipg_bucket.append((i, param, param_id))
+        self.report_ipg_memory_usage("End ipg_remove_grads", 0)
+
     def gradient_reduction_w_predivide(self, tensor):
         dp_world_size = dist.get_world_size(group=self.dp_process_group)
 
@@ -2100,6 +2119,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.params_in_ipg_bucket = []
         self.elements_in_ipg_bucket = 0
         #####################################################################
+
+    @instrument_w_nvtx
+    def reduce_ready_partitions_and_remove_grads(self, param, i):
+        #print_rank_0(f"Backward {debug_param2name_id_shape(param)}", force=True)
+        self.reduce_independent_p_g_buckets_and_remove_grads(param, i)
 
     def zero_reduced_gradients(self, partition_id, i):
         def are_all_related_partitions_reduced(params_id):
