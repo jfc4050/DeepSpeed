@@ -1490,15 +1490,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
-        self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         with torch.cuda.stream(self.reduction_stream):
+            self.partition_previous_reduced_grads()
+
+            self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
             self.__reduce_ipg_grads()
-        self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
+            self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
-        if self.overlap_comm:
-            self.reduction_stream.synchronize()
-
-        with torch.cuda.stream(self.reduction_stream):
             self.partition_previous_reduced_grads()
 
         # if dist.get_rank() == 0:
@@ -1527,6 +1525,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage(f"End ipg_epilogue", force=False)
 
+        torch.cuda.current_stream().wait_stream(self.reduction_stream)
         self.zero_grad()
 
     def __init_reduce_and_remove_grad_hooks(self):
@@ -1587,6 +1586,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                          param.ds_numel)
 
             with torch.cuda.stream(self.reduction_stream):
+                self.partition_previous_reduced_grads()
                 self.__reduce_ipg_grads()
 
             if self.contiguous_gradients and self.overlap_comm:
@@ -1833,11 +1833,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def __reduce_ipg_grads(self) -> None:
-        if self.overlap_comm:
-            self.reduction_stream.synchronize()  # TODO. is this still needed?
-
-        self.partition_previous_reduced_grads()
-
         params_to_reduce = [param for _, param, _ in self.params_in_ipg_bucket]
         #print(f"Params in ipg bucket {self.params_in_ipg_bucket}")
         #print(f"Reducing {[(debug_param2name_id_shape(param), param.grad) for param in params_to_reduce]}")
