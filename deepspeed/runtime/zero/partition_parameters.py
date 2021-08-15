@@ -352,13 +352,11 @@ class InsertPostInitMethodToModuleSubClasses(object):
 class AllGatherCoalescedHandle:
     def __init__(
             self,
-            handle,
             params: list,
             partitions: list,
             world_size: int,
             comm_stream: Stream,
     ) -> None:
-        self.__handle = handle
         self.__params = params
         self.__partitions = partitions
         self.__world_size = world_size
@@ -376,8 +374,6 @@ class AllGatherCoalescedHandle:
             return
 
         with torch.cuda.stream(self.__comm_stream):
-            instrument_w_nvtx(self.__handle.wait)()  # wait for the allgather to complete
-
             # split the single tensor out into individual tensors
             param_offset = 0
             for param in self.__params:
@@ -692,16 +688,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     torch.cat)([p.ds_tensor.data for p in params_to_gather],
                                out=partitions[self.rank])
 
-                all_gather_handle = instrument_w_nvtx(
-                    torch.distributed._all_gather_base)(
-                        flat_tensor,
-                        partitions[self.rank],
-                        group=self.ds_process_group,
-                        async_op=True,
-                    )
+                instrument_w_nvtx(torch.distributed._all_gather_base)(
+                    flat_tensor,
+                    partitions[self.rank],
+                    group=self.ds_process_group,
+                )
 
                 return AllGatherCoalescedHandle(
-                    handle=all_gather_handle,
                     params=params_to_gather,
                     partitions=partitions,
                     world_size=self.world_size,
