@@ -229,9 +229,6 @@ class PartitionedParameterCoordinator:
 
     def reset_step(self) -> None:
         """indicate that we have completed one fwd+bwd for the model"""
-        print_rank_0(
-            f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}",
-            force=True)
         if not self.trace_complete:
             # make sure that recorded parameter and submodule orders are
             # identical across ranks
@@ -243,6 +240,8 @@ class PartitionedParameterCoordinator:
             self.__submodule_order = tuple(self.__submodule_order)  # freeze
             self.__param_order = tuple(self.__param_order)  # freeze
             self.trace_complete = True
+            print_rank_0(f"completed trace: {[m.id for m in self.__submodule_order]}",
+                         force=True)
 
         self.__param_queue = collections.deque(self.__param_order)  # reset fetch queue
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(
