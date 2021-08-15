@@ -633,7 +633,11 @@ def call_to_str(base, *args, **kwargs):
     name += ')'
     return name
 
-def info_rank_0(message: str) -> None:
-    if dist.get_rank() == 0:
-        print(message)
 
+def info_rank_0(message: str) -> None:
+    # if False:
+    #     logger.info(f"RANK{dist.get_rank()} {message}")
+    # else:
+    #     if dist.get_rank() == 0:
+    #         print(message)
+    pass
