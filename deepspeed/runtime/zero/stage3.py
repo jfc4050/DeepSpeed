@@ -674,7 +674,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # Holds the mode parameter
         # The param.data may not hold any meaningful data
         # when param's status is NOT_AVAILABLE or IN_FLGHT
-        self.fp16_groups = []
+        self.fp16_groups: List[List[Parameter]] = []
 
         # Hold partitioned parameters
         self.fp16_partitioned_groups = []
@@ -1698,9 +1698,20 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return total_norm
 
     @instrument_w_nvtx
-    def __reduce_and_partition_ipg_grads(self):
-        params_to_reduce = [param for _, param, _ in self.params_in_ipg_bucket]
+    def __reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
+        params_to_reduce = sorted((param for _,
+                                   param,
+                                   _ in self.params_in_ipg_bucket),
+                                  key=lambda p: p.ds_id)
+        if self.extra_large_param_to_reduce is not None:
+            params_to_reduce.append(self.extra_large_param_to_reduce)
         self.params_in_ipg_bucket.clear()
+        self.extra_large_param_to_reduce = None
+
+        assert len(set(p.ds_id for p in params_to_reduce)) == len(params_to_reduce)
+        if safe_mode:
+            assert_ints_same_as_other_ranks([p.ds_id for p in params_to_reduce])
+
         self.__reduce_grads(params_to_reduce)
         self.__partition_grads(params_to_reduce)
 
@@ -1791,18 +1802,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def __reduce_grads(self, params_to_reduce: List[Parameter]) -> None:
         if self.contiguous_gradients:
-            reduction_list = [self.ipg_buffer]
-            if self.extra_large_param_to_reduce is not None:
-                reduction_list.append(self.extra_large_param_to_reduce.grad)
-                self.extra_large_param_to_reduce = None
-
             if not self.reduce_scatter:
-                for tensor in reduction_list:
-                    self.gradient_reduction_w_predivide(tensor)
+                for param in params_to_reduce:
+                    self.gradient_reduction_w_predivide(param.grad)
                 return
 
-            for tensor in reduction_list:
-                tensor.div_(dist.get_world_size(group=self.dp_process_group))
+            for param in params_to_reduce:
+                param.grad.div_(dist.get_world_size(group=self.dp_process_group))
 
             # reduction resulting with each rank only holding the gradient partition it owns
             # This could either be a reduce scatter or a reduce op depending on how
@@ -2328,7 +2334,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if self.contiguous_gradients:
             self.ipg_buffer = torch.empty(self.reduce_bucket_size,
                                           dtype=self.dtype,
-                                          device=torch.cuda.current_device())
+                                          device=torch.cuda.current_device(),
+                                          requires_grad=False)
 
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
