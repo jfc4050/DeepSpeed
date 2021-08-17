@@ -346,15 +346,12 @@ class EltwiseMultiplicationTestNetwork(Module):
 
 
 @pytest.mark.parametrize("param_persistence_threshold", [0, 10])
-# TODO. fails for some reason when not using contiguous gradients
-@pytest.mark.parametrize("contiguous_gradients", [True])
-@pytest.mark.parametrize("overlap_comm", [True, False])
 @pytest.mark.parametrize("fp16_enabled", [True, False])
+@pytest.mark.parametrize("iteration", list(range(25)))
 def test_zero3_param_partitioning_base(
         param_persistence_threshold: int,
-        contiguous_gradients: bool,
-        overlap_comm: bool,
         fp16_enabled: bool,
+        iteration: int,
 ) -> None:
     @distributed_test(world_size=[2])
     def _test_zero3_param_partitioning():
@@ -376,8 +373,6 @@ def test_zero3_param_partitioning_base(
                     "stage": 3,
                     "stage3_max_reuse_distance": 0,
                     "stage3_param_persistence_threshold": param_persistence_threshold,
-                    "contiguous_gradients": contiguous_gradients,
-                    "overlap_comm": overlap_comm,
                 },
                 "optimizer": {
                     "type": "Adam",
@@ -492,58 +487,31 @@ def test_zero3_param_partitioning_base(
             assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
             weight_gradients: List[Tensor] = avgd_gradients[0]
 
-            # FIXME: flaky failures on [fp16, overlap, contiguous, persist_thresh]
+            # FIXME: flaky failures on [fp16, persist_thresh]
             # just taking some notes on different race conditions encountered
             # with multiple runs...
             #
-            # category 1
-            # - A: [F-T-T-10]
-            #      [F-T-T-10] m: [0, 1, 2, 3, 4, 4, 3, 2, 1], p: [0, 1, 2, 2, 1, 0]
-            #      [T-T-T-10] m: [0, 1, 2, 3, 4, 4, 3, 2, 1], p: [0, 1, 2, 2, 1, 0]
-            # - C: [T-T-T-10]
-            # this appears to be from erroneously fetching layer3 instead of layer2
-            #
-            # category 2
-            # - B: [F-F-T-0]
-            #      [T-F-T-0]
-            #      [T-T-T-0] m: [0, 1, 2, 3, 4, 4, 3, 2, 1], p: [0, 1, 2, 2, 1, 0]
-            # - D: [T-T-T-10]
-            # something at layer 2 is getting divided in half for some reason
-            # seems to be either one rank or another but not both at once
-            #
-            # category 3
-            # - E: [F-T-T-10] m: [0, 1, 2, 3, 4, 4, 3, 2, 1]
-            #
-            # uncategorized
-            # - F: [T-T-T-10] m: [0, 1, 2, 3, 4, 4, 3, 2, 1], p: [0, 1, 2, 2, 1, 0]
-            #
-            # questions:
-            # - why do these only happen in backward?
+            # A: 2x [F-10]
+            #    3x [F-0]
+            #    1x [T-0]
 
             dloss_wrt_layer1, dloss_wrt_layer2, dloss_wrt_layer3 = weight_gradients
             # dloss_wrt_layer3 = hidden2
             # dloss_wrt_layer2 = layer3 * hidden1
             # dloss_wrt_layer1 = layer3 * layer2 * x
             if dist.get_rank() == 0:
-                assert torch.allclose(dloss_wrt_layer3, create_tensor([2] * 8))
-                # FIXME: B - get 2.5 - ???
-                assert torch.allclose(dloss_wrt_layer2, create_tensor([3 * 1] * 8))
-                # FIXME: A - get 9 - fetched layer3 instead of layer2
-                # FIXME: C - get 9 - fetched layer3 instead of layer2
-                # FIXME: E - get 4.5 - fetched wrong layer AND divided by 2?
-                assert torch.allclose(dloss_wrt_layer1, create_tensor([3 * 2 * 1] * 8))
+                assert torch.allclose(dloss_wrt_layer3, create_tensor([2] * 8)), dloss_wrt_layer3
+                assert torch.allclose(dloss_wrt_layer2, create_tensor([3 * 1] * 8)), dloss_wrt_layer2
+                # FIXME: A - get 4.5 - ??? (note that world size is 2)
+                assert torch.allclose(dloss_wrt_layer1, create_tensor([3 * 2 * 1] * 8)), dloss_wrt_layer1
             elif dist.get_rank() == 1:
                 # parameters dont split evenly across ranks so rank 1 has a zero-padded
                 # partition
-                assert torch.allclose(dloss_wrt_layer3, create_tensor(([8] * 7) + [0]))
-                # FIXME: D - get 10 - somehow 1 got subtracted from layer3? - i think this is related to B
+                assert torch.allclose(dloss_wrt_layer3, create_tensor(([8] * 7) + [0])), dloss_wrt_layer3
                 assert torch.allclose(dloss_wrt_layer2,
-                                      create_tensor(([6 * 2] * 7) + [0]))
-                # FIXME: A - get 36 - fetched layer3 instead of layer2
-                # FIXME: C - get 12 - fetched layer1 (???) instead of layer2
-                # FIXME: F - get 18 - somehow 1 got subtracted from layer2?
+                                      create_tensor(([6 * 2] * 7) + [0])), dloss_wrt_layer1
                 assert torch.allclose(dloss_wrt_layer1,
-                                      create_tensor(([6 * 4 * 1] * 7) + [0]))
+                                      create_tensor(([6 * 4 * 1] * 7) + [0])), dloss_wrt_layer1
             else:
                 raise RuntimeError("test has world size of two")
 
