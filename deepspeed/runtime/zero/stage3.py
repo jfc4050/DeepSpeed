@@ -559,14 +559,16 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.module = module
         self.elastic_checkpoint = elastic_checkpoint
-        self.overlap_comm = overlap_comm
 
         # Replace ._parameters with a new class to enable auto-registration of
         # external parameters
         _inject_parameters(module, ZeROOrderedDict)
 
-        if self.overlap_comm:
-            self.gpu_sum = torch.zeros(1, dtype=torch.float).cuda()
+        self.__gradient_sum_for_inf_or_nan_tracking: Tensor = torch.zeros(
+            1,
+            dtype=torch.float,
+            device=torch.cuda.current_device(),
+            requires_grad=False)
 
         ###################### offload optimizer setup ##################################
         self.optimizer_swapper = None
@@ -1661,13 +1663,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         #Using a more memory efficient version
         self.norm_for_param_grads[param_id] = self._constant_buffered_norm2(param.grad)
 
-    def update_overflow_tracker_for_param_grad(self, param):
+    def update_overflow_tracker_for_param_grad(self, param: Parameter) -> None:
         #Credit to our user David Minn
         if param.grad is not None:
-            if self.overlap_comm:
-                self.gpu_sum = self.gpu_sum + param.grad.data.float().sum()
-            elif self._has_inf_or_nan(param.grad.data):
-                self.local_overflow = True
+            self.__gradient_sum_for_inf_or_nan_tracking.add_(
+                param.grad.data.float().sum())
 
     def complete_grad_norm_calculation_for_cpu_offload(self, params):
         total_norm = 0.0
@@ -2265,9 +2265,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def has_overflow(self, partition_gradients=True):
         if partition_gradients:
-            if self.overlap_comm:
-                self.local_overflow = self._has_inf_or_nan(self.gpu_sum)
-                self.gpu_sum = torch.zeros(1, dtype=torch.float).cuda()
+            self.local_overflow = self._has_inf_or_nan(
+                self.__gradient_sum_for_inf_or_nan_tracking)
+            self.__gradient_sum_for_inf_or_nan_tracking.zero_()
 
             overflow = self.local_overflow if self.offload_optimizer else self.has_overflow_partitioned_grads_serial(
             )
