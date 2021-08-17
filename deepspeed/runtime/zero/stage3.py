@@ -743,6 +743,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.extra_large_param_to_reduce: Parameter = None
         self.params_in_ipg_bucket: List[Tuple[int, Parameter, int]] = []
         self.is_gradient_accumulation_boundary = True
+        self.ipg_buffer: Tensor = None
         self._release_ipg_buffers()
 
         # simplified param id
@@ -1554,7 +1555,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     ###############Idependent Partition Gradient ########################
     @instrument_w_nvtx
-    def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
+    def reduce_independent_p_g_buckets_and_remove_grads(self,
+                                                        param: Parameter,
+                                                        i: int) -> None:
         #print_rank_0(f"Inside reduce ipg buckets. {debug_param2name_id_shape(param)}, ipg elements {self.elements_in_ipg_bucket}, reduce bucket size {self.reduce_bucket_size}", force=True)
 
         # Because the ipg bucket is initialized with a random place holder tensor, we must
@@ -1562,14 +1565,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
         # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
         # empty, while reduction_list will have that garbage data.
-        if self.elements_in_ipg_bucket > 0 and self.elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
+        if self.elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
             self.__reduce_and_partition_ipg_grads()
-
-            if self.contiguous_gradients and self.overlap_comm:
-                # Swap ipg_index between 0 and 1
-                self.ipg_index = 1 - self.ipg_index
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads",
                                          param.ds_numel)
 
@@ -1578,13 +1577,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
         if param.ds_numel > self.reduce_bucket_size:
             self.extra_large_param_to_reduce = param
-
         elif self.contiguous_gradients:
             #print_rank_0("before new grad tensor move")
-            new_grad_tensor = self.ipg_buffer[self.ipg_index].narrow(
-                0,
-                self.elements_in_ipg_bucket,
-                param.ds_numel)
+            new_grad_tensor = self.ipg_buffer.narrow(0,
+                                                     self.elements_in_ipg_bucket,
+                                                     param.ds_numel)
             #print_rank_0("after new grad tensor move")
             new_grad_tensor.copy_(param.grad.view(-1))
             param.grad.data = new_grad_tensor.data.view_as(param.grad)
@@ -1794,7 +1791,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def __reduce_grads(self, params_to_reduce: List[Parameter]) -> None:
         if self.contiguous_gradients:
-            reduction_list = [self.ipg_buffer[self.ipg_index]]
+            reduction_list = [self.ipg_buffer]
             if self.extra_large_param_to_reduce is not None:
                 reduction_list.append(self.extra_large_param_to_reduce.grad)
                 self.extra_large_param_to_reduce = None
@@ -2329,19 +2326,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage(f"Before backward", force=False)
         if self.contiguous_gradients:
-            self.ipg_buffer = []
-            buf_0 = torch.empty(self.reduce_bucket_size,
-                                dtype=self.dtype,
-                                device=torch.cuda.current_device())
-            self.ipg_buffer.append(buf_0)
-
-            # Use double buffers to avoid data access conflict when overlap_comm is enabled.
-            if self.overlap_comm:
-                buf_1 = torch.empty(self.reduce_bucket_size,
-                                    dtype=self.dtype,
-                                    device=torch.cuda.current_device())
-                self.ipg_buffer.append(buf_1)
-            self.ipg_index = 0
+            self.ipg_buffer = torch.empty(self.reduce_bucket_size,
+                                          dtype=self.dtype,
+                                          device=torch.cuda.current_device())
 
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
