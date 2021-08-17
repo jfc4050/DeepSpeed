@@ -13,6 +13,7 @@ import itertools
 from typing import List
 
 import torch
+from torch import Tensor
 from torch.cuda import Stream
 import torch.distributed
 from torch.distributed.distributed_c10d import _get_global_rank
@@ -718,7 +719,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             print_rank_0(
                 f"{'--'*hierarchy}----Reducing Gradients for param with ids {[param.ds_id for param in param_list]} to owner"
             )
-            self._reduce_scatter_gradients(param_list)
+            for p in param_list:
+                self._reduce_scatter_gradient(p)
 
         @instrument_w_nvtx
         def partition_gradients(param_list=None,
@@ -1082,59 +1084,25 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         return None
 
     @instrument_w_nvtx
-    def _reduce_scatter_gradients(self, param_list):
-        #print_rank_0([param.grad for param in param_list])
-        #assert any([param.grad is None for param in param_list]), "None gradients cannot be reduce scattered"
-
-        handles_and_reduced_partitions = []
-        for param in param_list:
-            assert param.grad.numel(
-            ) == param.ds_numel, f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter gradients whose size is not same as the params"
-
-            handles_and_reduced_partitions.append(self._reduce_scatter_gradient(param))
-
-        for param, (handle, reduced_partition) in zip(param_list, handles_and_reduced_partitions):
-            if handle is not None:
-                handle.wait()
-
-            # some ranks may have partitions that are padded to go beyond the grad size.
-            # For these ranks the output of reduce scatter is a separate buffer and needs
-            # to be copied in
-            partition_size = param.ds_tensor.ds_numel
-            start = self.rank * partition_size
-            end = start + partition_size
-            #print_rank_0("REduce scatter was executed for praam {param.ds_id}")
-            if start < param.ds_numel and end > param.ds_numel:
-                elements = param.ds_numel - start
-                param.grad.view(-1).narrow(0,
-                                           start,
-                                           elements).copy_(
-                                               reduced_partition.narrow(0,
-                                                                        0,
-                                                                        elements))
-
-    @instrument_w_nvtx
-    def _reduce_scatter_gradient(self, param):
+    def _reduce_scatter_gradient(self, param: Parameter) -> None:
+        if param.grad.numel() != param.ds_numel:
+            raise RuntimeError(
+                f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter "
+                f"gradients whose size is not same as the params")
 
         partition_size = param.ds_tensor.ds_numel
-        #output = torch.empty(partition_size, dtype=param.dtype, device=param.device)
 
-        total_size = partition_size * self.world_size
-        input_list = []
-
+        input_list: List[Tensor] = []
         for i in range(self.world_size):
-
             start = i * partition_size
             end = start + partition_size
 
-            #print("before reduce scatter gradients")
             if start < param.ds_numel and end <= param.ds_numel:
                 input = param.grad.view(-1).narrow(0, start, partition_size)
             else:
                 input = torch.zeros(partition_size,
                                     dtype=param.dtype,
                                     device=param.device)
-
                 if start < param.ds_numel:
                     elements = param.ds_numel - start
                     input.narrow(0,
@@ -1143,16 +1111,26 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                      param.grad.view(-1).narrow(0,
                                                                 start,
                                                                 elements))
-            #print("after reduce scatter gradients")
             input_list.append(input)
 
-        rank = torch.distributed.get_rank(group=self.ds_process_group)
-        handle = torch.distributed.reduce_scatter(input_list[rank],
-                                                  input_list,
-                                                  group=self.ds_process_group,
-                                                  async_op=True)
+        reduced_partition = input_list[self.rank]
+        instrument_w_nvtx(torch.distributed.reduce_scatter)(reduced_partition,
+                                                            input_list,
+                                                            group=self.ds_process_group)
 
-        return handle, input_list[rank]
+        # some ranks may have partitions that are padded to go beyond the grad size.
+        # For these ranks the output of reduce scatter is a separate buffer and needs
+        # to be copied in
+        start = self.rank * partition_size
+        end = start + partition_size
+        if start < param.ds_numel and end > param.ds_numel:
+            elements = param.ds_numel - start
+            param.grad.view(-1).narrow(0,
+                                       start,
+                                       elements).copy_(
+                                           reduced_partition.narrow(0,
+                                                                    0,
+                                                                    elements))
 
     @instrument_w_nvtx
     def _partition_gradients(self, param_list, partition_buffers=None, accumulate=False):
