@@ -9,7 +9,7 @@ import os
 import collections
 from collections import OrderedDict, UserDict
 import itertools
-from typing import Iterable, Set
+from typing import Iterable, Set, Tuple
 import torch
 from torch.distributed.distributed_c10d import _get_global_rank
 from torch.nn import Module, Parameter
@@ -742,13 +742,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.contiguous_gradients = contiguous_gradients
         self.extra_large_param_to_reduce = None
-        self.grads_in_ipg_bucket = []
-        self.params_in_ipg_bucket = []
-        self.elements_in_ipg_bucket = 0
-        self.params_already_reduced = []
+        self.params_in_ipg_bucket: List[Tuple[int, Parameter, int]] = []
         self.is_gradient_accumulation_boundary = True
         self._release_ipg_buffers()
-        self.previous_reduced_grads = None
 
         # simplified param id
         self.param_id = {}
@@ -759,7 +755,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 unique_id = id(param)
                 self.param_id[unique_id] = count
                 self.param_dict[count] = param
-                self.params_already_reduced.append(False)
                 count = count + 1
 
         #Largest partitioned param
@@ -846,6 +841,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             device=self.device,
             dtype=torch.float32,
             timers=self.timers)
+
+    @property
+    def elements_in_ipg_bucket(self):
+        return sum(p.ds_numel for _, p, _ in self.params_in_ipg_bucket)
 
     def _move_to_flat_buffer(self, param_list, flat_buffer, avoid_copy=False):
         '''If flat buffer is None then the parameters in the param_list are
@@ -1484,18 +1483,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
-        self.partition_previous_reduced_grads()
-
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
-        self.__reduce_ipg_grads()
+        self.__reduce_and_partition_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
-
-        self.partition_previous_reduced_grads()
-
-        # if dist.get_rank() == 0:
-        #    logger.info("Params already reduced %s", self.params_already_reduced)
-        for i in range(len(self.params_already_reduced)):
-            self.params_already_reduced[i] = False
 
         #in case of cpu offload, averaged gradients are already in fp32_partitioned_groups_flat.grad
         #TODO: use a similar code path for both cpu_offload and non-cpu offload
@@ -1576,9 +1566,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if self.elements_in_ipg_bucket > 0 and self.elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
-
-            self.partition_previous_reduced_grads()
-            self.__reduce_ipg_grads()
+            self.__reduce_and_partition_ipg_grads()
 
             if self.contiguous_gradients and self.overlap_comm:
                 # Swap ipg_index between 0 and 1
@@ -1587,10 +1575,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                          param.ds_numel)
 
         param_id = self.get_param_id(param)
-        assert self.params_already_reduced[param_id] == False, \
-            f"The parameter {param_id} has already been reduced. \
-            Gradient computed twice for this partition. \
-            Multiple gradient reduction is currently not supported"
 
         # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
         if param.ds_numel > self.reduce_bucket_size:
@@ -1606,8 +1590,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             new_grad_tensor.copy_(param.grad.view(-1))
             param.grad.data = new_grad_tensor.data.view_as(param.grad)
 
-        self.elements_in_ipg_bucket += param.ds_numel
-        self.grads_in_ipg_bucket.append(param.grad)
         self.params_in_ipg_bucket.append((i, param, param_id))
         self.report_ipg_memory_usage("End ipg_remove_grads", 0)
 
@@ -1720,8 +1702,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return total_norm
 
     @instrument_w_nvtx
-    def partition_previous_reduced_grads(self):
-        if not self.previous_reduced_grads:
+    def __reduce_and_partition_ipg_grads(self):
+        params_to_reduce = [param for _, param, _ in self.params_in_ipg_bucket]
+        self.params_in_ipg_bucket.clear()
+        self.__reduce_grads(params_to_reduce)
+        self.__partition_grads(params_to_reduce)
+
+    @instrument_w_nvtx
+    def __partition_grads(self, params_to_release: List[Parameter]) -> None:
+        if not params_to_release:
             return
 
         if self.offload_optimizer:
@@ -1759,7 +1748,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             offload_fp32_gradients = {}
             offload_fp32_offsets = {}
 
-        for param in self.previous_reduced_grads:
+        for param in params_to_release:
 
             [i, dest_offset, num_elements] = self.grad_position[self.get_param_id(param)]
 
@@ -1813,14 +1802,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     gradient_offsets=offload_fp32_offsets[i],
                     gradient_tensors=offload_fp32_gradients[i])
 
-        self.previous_reduced_grads = []
-
     @instrument_w_nvtx
-    def __reduce_ipg_grads(self) -> None:
-        params_to_reduce = [param for _, param, _ in self.params_in_ipg_bucket]
-        #print(f"Params in ipg bucket {self.params_in_ipg_bucket}")
-        #print(f"Reducing {[(debug_param2name_id_shape(param), param.grad) for param in params_to_reduce]}")
-        #exit(0)
+    def __reduce_grads(self, params_to_reduce: List[Parameter]) -> None:
         if self.contiguous_gradients:
             reduction_list = [self.ipg_buffer[self.ipg_index]]
             if self.extra_large_param_to_reduce is not None:
@@ -1845,29 +1828,21 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 hierarchy=self.param_coordinator.hierarchy)
         else:
             for dtype in {f"torch.cuda.{p}Tensor" for p in ["Half", "Float", "Double"]}:
-                bucket = [t for t in self.grads_in_ipg_bucket if t.type() == dtype]
+                bucket = [p.grad for p in params_to_reduce if p.grad.type() == dtype]
                 if not bucket:
                     continue
 
                 small_bucket = []
                 numel = 0
+                numel_to_reduce = sum(p.ds_numel for p in params_to_reduce)
                 for tensor in bucket:
                     small_bucket.append(tensor)
-                    numel = numel + tensor.numel()
-                    if numel > self.elements_in_ipg_bucket:
+                    numel += tensor.numel()
+                    if numel > numel_to_reduce:
                         self.__allreduce_and_copy(small_bucket, rank=None, log=None)
                         small_bucket = []
                 if len(small_bucket) > 0:
                     self.__allreduce_and_copy(small_bucket, rank=None, log=None)
-
-        for _, _, param_id in self.params_in_ipg_bucket:
-            self.params_already_reduced[param_id] = True
-
-        self.previous_reduced_grads = params_to_reduce
-
-        self.grads_in_ipg_bucket = []
-        self.params_in_ipg_bucket = []
-        self.elements_in_ipg_bucket = 0
 
     ######################Reduction Related Methods##############################
 
