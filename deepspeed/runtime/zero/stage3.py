@@ -733,12 +733,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.reduce_bucket_size = int(reduce_bucket_size)
 
-        self.reduction_event = torch.cuda.Event(enable_timing=False, blocking=False)
-
-        self.reduction_stream = torch.cuda.Stream(
-        ) if self.overlap_comm else torch.cuda.current_stream()
         self.callback_queued = False
-        self.copy_grad_stream = torch.cuda.Stream()
 
         self.param_dict = {}
 
@@ -1489,14 +1484,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
-        with torch.cuda.stream(self.reduction_stream):
-            self.partition_previous_reduced_grads()
+        self.partition_previous_reduced_grads()
 
-            self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
-            self.__reduce_ipg_grads()
-            self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
+        self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
+        self.__reduce_ipg_grads()
+        self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
-            self.partition_previous_reduced_grads()
+        self.partition_previous_reduced_grads()
 
         # if dist.get_rank() == 0:
         #    logger.info("Params already reduced %s", self.params_already_reduced)
@@ -1524,7 +1518,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage(f"End ipg_epilogue", force=False)
 
-        torch.cuda.current_stream().wait_stream(self.reduction_stream)
         self.zero_grad()
 
     def __init_reduce_and_remove_grad_hooks(self):
@@ -1584,9 +1577,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
 
-            with torch.cuda.stream(self.reduction_stream):
-                self.partition_previous_reduced_grads()
-                self.__reduce_ipg_grads()
+            self.partition_previous_reduced_grads()
+            self.__reduce_ipg_grads()
 
             if self.contiguous_gradients and self.overlap_comm:
                 # Swap ipg_index between 0 and 1
@@ -1767,66 +1759,59 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             offload_fp32_gradients = {}
             offload_fp32_offsets = {}
 
-        with torch.cuda.stream(self.copy_grad_stream):
-            self.reduction_stream.synchronize()
-            for param in self.previous_reduced_grads:
+        for param in self.previous_reduced_grads:
 
-                [i,
-                 dest_offset,
-                 num_elements] = self.grad_position[self.get_param_id(param)]
+            [i, dest_offset, num_elements] = self.grad_position[self.get_param_id(param)]
 
-                if self.offload_optimizer:
-                    param.partition_gradients(
-                        partition_buffers=self.temp_grad_gpu_buffer)
-                    if self.gradient_accumulation_steps > 1:
-                        # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
-                        fp16_grad_tensor = self.grads_in_partition[i].narrow(
-                            0,
-                            dest_offset,
-                            num_elements)
-                        self.async_accumulate_grad_in_cpu_via_gpu(
-                            param,
-                            fp16_grad_tensor)
-
-                    if self.is_gradient_accumulation_boundary:
-
-                        self.set_norm_for_param_grad_in_gpu(param)
-
-                        self.update_overflow_tracker_for_param_grad(param)
-
-                        if self._swappable_optimizer_subgroup(i):
-                            if not i in offload_fp32_gradients.keys():
-                                offload_fp32_gradients[i] = []
-                                offload_fp32_offsets[i] = []
-
-                            offload_fp32_gradients[i].append(param.grad.view(-1).float())
-                            param.grad = None
-                            offload_fp32_offsets[i].append(dest_offset)
-                        else:
-                            # copy grad from GPU to fp32 buffer
-                            fp32_grad_tensor = self.fp32_partitioned_groups_flat[
-                                i].grad.narrow(0,
-                                               dest_offset,
-                                               num_elements)
-                            fp32_grad_tensor.copy_(param.grad.view(-1).float(),
-                                                   non_blocking=True)
-                            param.grad = None
-                else:
+            if self.offload_optimizer:
+                param.partition_gradients(partition_buffers=self.temp_grad_gpu_buffer)
+                if self.gradient_accumulation_steps > 1:
                     # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
                     fp16_grad_tensor = self.grads_in_partition[i].narrow(
                         0,
                         dest_offset,
                         num_elements)
-                    param.partition_gradients(
-                        partition_buffers=fp16_grad_tensor,
-                        accumulate=True if self.micro_step_id > 0 else False)
+                    self.async_accumulate_grad_in_cpu_via_gpu(param, fp16_grad_tensor)
 
-            if self.offload_optimizer and self.swap_optimizer:
-                for i in offload_fp32_gradients.keys():
-                    self.optimizer_swapper.swap_out_gradients(
-                        parameter=self.fp32_partitioned_groups_flat[i],
-                        gradient_offsets=offload_fp32_offsets[i],
-                        gradient_tensors=offload_fp32_gradients[i])
+                if self.is_gradient_accumulation_boundary:
+
+                    self.set_norm_for_param_grad_in_gpu(param)
+
+                    self.update_overflow_tracker_for_param_grad(param)
+
+                    if self._swappable_optimizer_subgroup(i):
+                        if not i in offload_fp32_gradients.keys():
+                            offload_fp32_gradients[i] = []
+                            offload_fp32_offsets[i] = []
+
+                        offload_fp32_gradients[i].append(param.grad.view(-1).float())
+                        param.grad = None
+                        offload_fp32_offsets[i].append(dest_offset)
+                    else:
+                        # copy grad from GPU to fp32 buffer
+                        fp32_grad_tensor = self.fp32_partitioned_groups_flat[
+                            i].grad.narrow(0,
+                                           dest_offset,
+                                           num_elements)
+                        fp32_grad_tensor.copy_(param.grad.view(-1).float(),
+                                               non_blocking=True)
+                        param.grad = None
+            else:
+                # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
+                fp16_grad_tensor = self.grads_in_partition[i].narrow(
+                    0,
+                    dest_offset,
+                    num_elements)
+                param.partition_gradients(
+                    partition_buffers=fp16_grad_tensor,
+                    accumulate=True if self.micro_step_id > 0 else False)
+
+        if self.offload_optimizer and self.swap_optimizer:
+            for i in offload_fp32_gradients.keys():
+                self.optimizer_swapper.swap_out_gradients(
+                    parameter=self.fp32_partitioned_groups_flat[i],
+                    gradient_offsets=offload_fp32_offsets[i],
+                    gradient_tensors=offload_fp32_gradients[i])
 
         self.previous_reduced_grads = []
 
