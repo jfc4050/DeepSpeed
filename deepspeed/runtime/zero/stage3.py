@@ -617,17 +617,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.device = torch.cuda.current_device(
         ) if not self.offload_optimizer else OFFLOAD_CPU_DEVICE
         ############################################################################
-
-        see_memory_usage("Before Partitioned Parameter Coordinator", force=False)
-
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=int(prefetch_bucket_size),
             max_reuse_distance_in_numel=int(max_reuse_distance),
             max_available_parameters_in_numel=int(max_live_parameters),
             prefetch_nvme=self.params_in_nvme_and_cpu,
         )
-
-        see_memory_usage("After Partitioned Parameter Coordinator", force=False)
 
         #-------------Stage 3 Setup-------------------#
         # parameters smaller than the threshold will be collectively gathered at the
@@ -658,8 +653,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.reduce_scatter = reduce_scatter
 
         self.dp_process_group = dp_process_group
-
-        self.partition_count = dist.get_world_size(group=self.dp_process_group)
 
         if mpu is None:
             self.model_parallel_group = None
@@ -700,16 +693,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         #that this process will update
         self.fp32_partitioned_groups_flat = []
         self.next_swappable_fp32_partitioned_groups = []
-
-        # number of elements per partition in each group
-        self.partition_size = []
-
-        self.all_reduce_print = False
-
-        self.prefetch_elements = int(prefetch_bucket_size)
-
-        # padding on each partition for alignment purposes
-        self.groups_padding = []
 
         self.sub_group_size = sub_group_size
 
@@ -969,13 +952,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 print_rank_0(
                     f"fp16 group {i} partitioned_param norms : {[param.ds_tensor.norm().item() for param in self.fp16_groups[i]]}"
                 )
-
-                # Record padding required to align group to world size (only applies to last rank)
-                if partition_id == dist.get_world_size(group=self.dp_process_group) - 1:
-                    padding = [p.padding_size() for p in self.fp16_groups[i]]
-                else:
-                    padding = [0] * len(self.fp16_groups[i])
-                self.groups_padding.append(padding)
 
                 #not sure why apex was cloning the weights before flattening
                 #removing cloning here
@@ -2413,7 +2389,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         state_dict['loss_scaler'] = self.loss_scaler
         state_dict['dynamic_loss_scale'] = self.dynamic_loss_scale
         state_dict['overflow'] = self.overflow
-        state_dict['partition_count'] = self.partition_count
+        state_dict['partition_count'] = dist.get_world_size(group=self.dp_process_group)
 
         self._set_fp32_optimizer_param_groups()
         state_dict['optimizer_state_dict'] = self.optimizer.state_dict()
