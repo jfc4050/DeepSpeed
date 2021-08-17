@@ -732,7 +732,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # map between param_id and bool to specify if a param is in this partition
         self.is_param_in_current_partition = {}
 
-        self.contiguous_gradients = contiguous_gradients
         self.extra_large_param_to_reduce: Parameter = None
         self.params_in_ipg_bucket: List[Tuple[int, Parameter, int]] = []
         self.is_gradient_accumulation_boundary = True
@@ -1346,10 +1345,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         module.register_forward_pre_hook(_post_backward_module_hook)
 
     def _release_ipg_buffers(self):
-        if self.contiguous_gradients:
-            self.ipg_buffer = None
-            if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
-                self.grads_in_partition = None
+        self.ipg_buffer = None
+        if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
+            self.grads_in_partition = None
 
     @instrument_w_nvtx
     def _optimizer_step(self, sub_group_id):
@@ -1563,7 +1561,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
         if param.ds_numel > self.reduce_bucket_size:
             self.extra_large_param_to_reduce = param
-        elif self.contiguous_gradients:
+        else:
             #print_rank_0("before new grad tensor move")
             new_grad_tensor = self.ipg_buffer.narrow(0,
                                                      self.elements_in_ipg_bucket,
@@ -1785,76 +1783,22 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def __reduce_grads(self, params_to_reduce: List[Parameter]) -> None:
-        if self.contiguous_gradients:
-            if not self.reduce_scatter:
-                for param in params_to_reduce:
-                    self.gradient_reduction_w_predivide(param.grad)
-                return
-
+        if not self.reduce_scatter:
             for param in params_to_reduce:
-                param.grad.div_(dist.get_world_size(group=self.dp_process_group))
+                self.gradient_reduction_w_predivide(param.grad)
+            return
 
-            # reduction resulting with each rank only holding the gradient partition it owns
-            # This could either be a reduce scatter or a reduce op depending on how
-            # parameters are partitionied. The method is implemented by the
-            # DeepSpeed param extensions to the pytorch parameter, so its up to
-            # the extension to define what happens here
-            params_to_reduce[0].reduce_gradients_at_owner(
-                param_list=params_to_reduce,
-                hierarchy=self.param_coordinator.hierarchy)
-        else:
-            for dtype in {f"torch.cuda.{p}Tensor" for p in ["Half", "Float", "Double"]}:
-                bucket = [p.grad for p in params_to_reduce if p.grad.type() == dtype]
-                if not bucket:
-                    continue
+        for param in params_to_reduce:
+            param.grad.div_(dist.get_world_size(group=self.dp_process_group))
 
-                small_bucket = []
-                numel = 0
-                numel_to_reduce = sum(p.ds_numel for p in params_to_reduce)
-                for tensor in bucket:
-                    small_bucket.append(tensor)
-                    numel += tensor.numel()
-                    if numel > numel_to_reduce:
-                        self.__allreduce_and_copy(small_bucket, rank=None, log=None)
-                        small_bucket = []
-                if len(small_bucket) > 0:
-                    self.__allreduce_and_copy(small_bucket, rank=None, log=None)
-
-    ######################Reduction Related Methods##############################
-
-    def allreduce_bucket(self, bucket, allreduce_always_fp32=False, rank=None, log=None):
-        rank = None
-        tensor = self.flatten(bucket)
-
-        tensor_to_allreduce = tensor
-
-        if pg_correctness_test:
-            allreduce_always_fp32 = True
-
-        if allreduce_always_fp32:
-            tensor_to_allreduce = tensor.float()
-
-        tensor_to_allreduce.div_(dist.get_world_size(group=self.dp_process_group))
-
-        if rank is None:
-            #    "All Reducing"
-            dist.all_reduce(tensor_to_allreduce, group=self.dp_process_group)
-        else:
-            global_rank = _get_global_rank(self.dp_process_group, rank)
-            dist.reduce(tensor_to_allreduce, global_rank, group=self.dp_process_group)
-
-        if allreduce_always_fp32 and tensor is not tensor_to_allreduce:
-            if rank is None or rank == dist.get_rank(group=self.dp_process_group):
-                tensor.copy_(tensor_to_allreduce)
-
-        return tensor
-
-    # if rank is specified do a reduction instead of an allreduce
-    def __allreduce_and_copy(self, small_bucket, rank=None, log=None):
-        allreduced = self.allreduce_bucket(small_bucket, rank=rank, log=log)
-        if rank is None or rank == dist.get_rank(group=self.dp_process_group):
-            for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
-                buf.copy_(synced)
+        # reduction resulting with each rank only holding the gradient partition it owns
+        # This could either be a reduce scatter or a reduce op depending on how
+        # parameters are partitionied. The method is implemented by the
+        # DeepSpeed param extensions to the pytorch parameter, so its up to
+        # the extension to define what happens here
+        params_to_reduce[0].reduce_gradients_at_owner(
+            param_list=params_to_reduce,
+            hierarchy=self.param_coordinator.hierarchy)
 
     #############################################################################
     #############################################################################
@@ -2315,11 +2259,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.optimizer_swapper.pre_backward()
 
         see_memory_usage(f"Before backward", force=False)
-        if self.contiguous_gradients:
-            self.ipg_buffer = torch.empty(self.reduce_bucket_size,
-                                          dtype=self.__param_dtype,
-                                          device=torch.cuda.current_device(),
-                                          requires_grad=False)
+        self.ipg_buffer = torch.empty(self.reduce_bucket_size,
+                                      dtype=self.__param_dtype,
+                                      device=torch.cuda.current_device(),
+                                      requires_grad=False)
 
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
