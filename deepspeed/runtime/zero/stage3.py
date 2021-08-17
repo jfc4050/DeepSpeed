@@ -9,7 +9,7 @@ import os
 import collections
 from collections import OrderedDict, UserDict
 import itertools
-from typing import Iterable, Set, Tuple
+from typing import Dict, Iterable, Set, Tuple
 import torch
 from torch.distributed.distributed_c10d import _get_global_rank
 from torch.nn import Module, Parameter
@@ -619,7 +619,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage("After Partitioned Parameter Coordinator", force=False)
 
-        #self.param_coordinator = PartitionedParameterCoordinator(comm_stream=torch.cuda.Stream())
         #-------------Stage 3 Setup-------------------#
         # parameters smaller than the threshold will be collectively gathered at the
         # end of the optimizer step and will be kept till the end of the backward pass
@@ -741,7 +740,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.is_param_in_current_partition = {}
 
         self.contiguous_gradients = contiguous_gradients
-        self.extra_large_param_to_reduce = None
+        self.extra_large_param_to_reduce: Parameter = None
         self.params_in_ipg_bucket: List[Tuple[int, Parameter, int]] = []
         self.is_gradient_accumulation_boundary = True
         self._release_ipg_buffers()
@@ -772,7 +771,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.set_grad_positions()
         see_memory_usage(f"Before CPU Offload initialization", force=False)
 
-        self.grads_in_partition = None
+        self.grads_in_partition: Dict[int, Tensor] = None
 
         if self.offload_optimizer:
             self.accumulated_grads_in_cpu = {}
@@ -1720,46 +1719,40 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             allocate_grads_in_partition = self.grads_in_partition is None
 
         if allocate_grads_in_partition:
-            self.grads_in_partition = []
+            self.grads_in_partition = {}
 
             for i, group in enumerate(self.fp16_groups):
-                total_size = 0
-                for param_in_partition in group:
-                    total_size += param_in_partition.ds_tensor.ds_numel
-
+                total_size = sum(p.ds_tensor.ds_numel for p in group)
                 see_memory_usage(
-                    f"group {i} before creating {total_size} reduced gradients into partition",
-                    force=False)
-                if self.offload_param_pin_memory:
-                    self.grads_in_partition.append(
-                        torch.zeros(int(total_size),
-                                    dtype=self.dtype,
-                                    device=self.device).pin_memory())
-                else:
-                    self.grads_in_partition.append(
-                        torch.zeros(int(total_size),
-                                    dtype=self.dtype,
-                                    device=self.device))
+                    f"group {i} before creating {total_size} reduced gradients into partition"
+                )
+                buffer: Tensor = torch.zeros(int(total_size),
+                                             dtype=self.dtype,
+                                             device=self.device,
+                                             pin_memory=self.offload_param_pin_memory)
                 see_memory_usage(
-                    f"group {i} after creating {total_size} reduced gradients into partition",
-                    force=False)
+                    f"group {i} after creating {total_size} reduced gradients into partition"
+                )
+                for param in group:
+                    param_id = self.get_param_id(param)
+                    i, dst_offset, num_elements = self.grad_position[param_id]
+                    self.grads_in_partition[param_id] = buffer.narrow(
+                        0,
+                        dst_offset,
+                        num_elements)
 
         if self.offload_optimizer:
             offload_fp32_gradients = {}
             offload_fp32_offsets = {}
 
         for param in params_to_release:
-
-            [i, dest_offset, num_elements] = self.grad_position[self.get_param_id(param)]
-
+            param_id = self.get_param_id(param)
             if self.offload_optimizer:
+                i, dest_offset, num_elements = self.grad_position[param_id]
                 param.partition_gradients(partition_buffers=self.temp_grad_gpu_buffer)
                 if self.gradient_accumulation_steps > 1:
                     # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
-                    fp16_grad_tensor = self.grads_in_partition[i].narrow(
-                        0,
-                        dest_offset,
-                        num_elements)
+                    fp16_grad_tensor = self.grads_in_partition[param_id]
                     self.async_accumulate_grad_in_cpu_via_gpu(param, fp16_grad_tensor)
 
                 if self.is_gradient_accumulation_boundary:
@@ -1786,14 +1779,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                                non_blocking=True)
                         param.grad = None
             else:
-                # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
-                fp16_grad_tensor = self.grads_in_partition[i].narrow(
-                    0,
-                    dest_offset,
-                    num_elements)
+                # allreduce buffer will be rewritten. copy gradients in partition to new buffer
                 param.partition_gradients(
-                    partition_buffers=fp16_grad_tensor,
-                    accumulate=True if self.micro_step_id > 0 else False)
+                    partition_buffers=self.grads_in_partition[param_id],
+                    accumulate=self.micro_step_id > 0)
 
         if self.offload_optimizer and self.swap_optimizer:
             for i in offload_fp32_gradients.keys():

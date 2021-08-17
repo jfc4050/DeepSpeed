@@ -1142,9 +1142,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                      accumulate=accumulate)
 
     @instrument_w_nvtx
-    def _partition_gradient(self, param, partition_buffer=None, accumulate=False):
-        #import pdb;pdb.set_trace()
-        # param.grad=None
+    def _partition_gradient(self,
+                            param: Parameter,
+                            partition_buffer: Tensor = None,
+                            accumulate: bool = False) -> None:
+        # import pdb; pdb.set_trace()
+        # param.grad = None
         # param.grad.test()
         info_rank_0(f"-partition grad for: {param.ds_summary()}")
         print_rank_0(
@@ -1158,53 +1161,35 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             partition_buffer = torch.zeros(partition_size,
                                            dtype=param.dtype,
                                            device=param.device)
-        else:
-            assert partition_buffer.numel() >= partition_size, f"The partition buffer size {partition_buffer.numel()} should match the size of param.ds_tensor {partition_size}"
+        assert partition_buffer.shape == (partition_size, )
 
-        rank = torch.distributed.get_rank(group=self.ds_process_group)
-        start = partition_size * rank
-        end = start + partition_size
-
-        dest_tensor_full_buffer = partition_buffer.view(-1).narrow(0, 0, partition_size)
-
-        #print("before partition gradients")
+        start = partition_size * torch.distributed.get_rank(group=self.ds_process_group)
         if start < param.ds_numel:
             elements = min(param.ds_numel - start, partition_size)
 
-            dest_tensor = dest_tensor_full_buffer.narrow(0, 0, elements)
+            dest_tensor = partition_buffer.narrow(0, 0, elements)
             src_tensor = param.grad.view(-1).narrow(0, start, elements)
 
-            # just copy the grad partition to the buffer
             if not accumulate:
+                # just copy the grad partition to the buffer
                 dest_tensor.copy_(src_tensor)
-
-            # if source and destinatoin are on same device,
-            # add to the provided buffer
             elif src_tensor.device == dest_tensor.device:
+                # if source and destination are on same device,
+                # add to the provided buffer
                 dest_tensor.add_(src_tensor)
-
-            # if source and destination are on different device, copy first to src
-            # then add and move back to the destination. This seems to run faster
-            # when src is gpu and dest is cpu
-            # adding directly to cpu is very slow
             else:
+                # if source and destination are on different device, copy first to src
+                # then add and move back to the destination. This seems to run faster
+                # when src is gpu and dest is cpu
+                # adding directly to cpu is very slow
                 acc_tensor = torch.empty(src_tensor.numel(),
                                          dtype=param.dtype,
                                          device=param.device)
-
                 acc_tensor.copy_(dest_tensor)
                 acc_tensor.add_(src_tensor)
                 dest_tensor.copy_(acc_tensor)
 
-            # partition_buffer.view(-1).narrow(
-            #     0,
-            #     0,
-            #     elements).copy_(param.grad.view(-1).narrow(0,
-            #                                             start,
-            #                                             elements))
-
-        #print("after partition gradients")
-        param.grad.data = dest_tensor_full_buffer.data
+        param.grad.data = partition_buffer.data
         see_memory_usage("After partitioning gradients", force=False)
 
 
