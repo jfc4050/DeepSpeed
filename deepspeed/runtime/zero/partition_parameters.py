@@ -399,7 +399,8 @@ class AllGatherCoalescedHandle:
                 param_offset += param.ds_tensor.ds_numel
 
             self.__complete = True
-            torch.cuda.default_stream().wait_stream(self.__comm_stream)
+
+        torch.cuda.current_stream().wait_stream(self.__comm_stream)
 
 
 # Replaces all parameters in module with Scattered Parameters
@@ -554,9 +555,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 self._convert_to_deepspeed_param(param)
                 param.partition()
 
-        # FIXME: figure out why we are getting race conditions when this is not
-        # same as default stream - somewhere we are not properly synchronizing streams
-        self.comm_stream = torch.cuda.current_stream()
+        self.__comm_stream = Stream()
 
     def _validate_remote_device(self, remote_device, ds_config):
         if ds_config is not None:
@@ -640,7 +639,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         @instrument_w_nvtx
         def all_gather_coalesced(params, safe_mode=False) -> AllGatherCoalescedHandle:
-            with torch.cuda.stream(self.comm_stream):
+            with torch.cuda.stream(self.__comm_stream):
                 # fetches from nvme if the partition is not available and in nvme
                 self._ensure_availability_of_partitioned_params(params)
 
@@ -699,7 +698,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     params=params_to_gather,
                     partitions=partitions,
                     world_size=self.world_size,
-                    comm_stream=self.comm_stream,
+                    comm_stream=self.__comm_stream,
                 )
 
         def partition(param_list=None, hierarchy=0, has_been_updated=False):
