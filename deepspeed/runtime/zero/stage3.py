@@ -677,10 +677,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # Holds the mode parameter
         # The param.data may not hold any meaningful data
         # when param's status is NOT_AVAILABLE or IN_FLGHT
-        self.fp16_groups: List[List[Parameter]] = []
-
-        # Hold partitioned parameters
-        self.fp16_partitioned_groups = []
+        self.__fp16_param_groups: List[List[Parameter]] = []
 
         # Holds a fused and flattened copy of the parameters
         self.fp16_partitioned_groups_flat = []
@@ -698,7 +695,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.sub_group_to_group_id = {}
         see_memory_usage("Before creating fp16 partitions", force=False)
-        self._create_fp16_partitions_with_defragmentation()
+        #create a flat CPU memory allocation for each param group
+        dist.barrier()
+        if self.offload_param:
+            self._create_param_groups_fp16_flat_cpu_memory()
+        self.__create_fp16_partitions_with_defragmentation()
         num_fp16_subgroups = len(self.fp16_partitioned_groups_flat)
         see_memory_usage(f"After creating fp16 partitions: {num_fp16_subgroups}",
                          force=False)
@@ -742,26 +743,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.param_id = {}
 
         count = 0
-        for i, params_group in enumerate(self.fp16_groups):
+        for i, params_group in enumerate(self.__fp16_param_groups):
             for param in params_group:
                 unique_id = id(param)
                 self.param_id[unique_id] = count
                 self.param_dict[count] = param
                 count = count + 1
 
-        #Largest partitioned param
-        largest_partitioned_param_numel = max([
-            max([tensor.numel() for tensor in fp16_partitioned_group])
-            for fp16_partitioned_group in self.fp16_partitioned_groups
-        ])
-        print_rank_0(
-            f'Largest partitioned param numel = {largest_partitioned_param_numel}',
-            force=False)
-
         see_memory_usage(f"Before Set Grad positions", force=False)
-
         self.grad_position = {}
         self.set_grad_positions()
+
         see_memory_usage(f"Before CPU Offload initialization", force=False)
 
         self.grads_in_partition: Dict[int, Tensor] = None
@@ -770,20 +762,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.accumulated_grads_in_cpu = {}
             self.norm_for_param_grads = {}
             self.local_overflow = False
+            largest_partitions_subgroup_numel = max(
+                param.ds_tensor.ds_numel for param_subgroup in self.__fp16_param_groups
+                for param in param_subgroup)
             self.temp_grad_buffer_for_gpu_offload = torch.zeros(
-                largest_partitioned_param_numel,
+                largest_partitions_subgroup_numel,
                 device=torch.cuda.current_device(),
                 dtype=self.__param_dtype)
-            self.temp_grad_gpu_buffer = torch.zeros(largest_partitioned_param_numel,
+            self.temp_grad_gpu_buffer = torch.zeros(largest_partitions_subgroup_numel,
                                                     device=torch.cuda.current_device(),
                                                     dtype=self.__param_dtype)
         see_memory_usage(f"After CPU Offload initialization", force=False)
-
-        # stores if a partition has been reduced in this step
-        self.is_partition_reduced = {}
-
-        # stores if a grad in a partition has been computed or not
-        self.is_grad_computed = {}
 
         # will store the averaged gradients required by this parititon
         self.averaged_gradients = {}
@@ -791,15 +780,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         #creates backward hooks for gradient partitioning
         self.__init_reduce_and_remove_grad_hooks()
 
-        #exit(0)
-
         # we may have a way of fusing dynamic scale. Do not support for now
         if self.__param_dtype == torch.float or not dynamic_loss_scale:
             loss_scale_value = 1.0 if self.__param_dtype == torch.float else static_loss_scale
 
             self.dynamic_loss_scale = False
             self.loss_scaler = LossScaler(scale=loss_scale_value)
-            cur_iter = 0
         else:
             if dynamic_loss_args is None:
                 self.loss_scaler = DynamicLossScaler()
@@ -808,7 +794,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             self.dynamic_loss_scale = True
 
-        self.debug_fp16_grads = [{} for _ in self.fp16_groups]
+        self.debug_fp16_grads = [{} for _ in self.__fp16_param_groups]
 
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage(f"After initializing ZeRO optimizer", force=False)
@@ -838,7 +824,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def elements_in_ipg_bucket(self):
         return sum(p.ds_numel for _, p, _ in self.params_in_ipg_bucket)
 
-    def _move_to_flat_buffer(self, param_list, flat_buffer, avoid_copy=False):
+    def _move_to_flat_buffer(self,
+                             param_list: List[Parameter],
+                             flat_buffer: Tensor,
+                             avoid_copy: bool = False) -> None:
         '''If flat buffer is None then the parameters in the param_list are
         not copied to the flat buffer. This is because they excede the number of max_params_in_cpu
         Some of these parameters may aready be in CPU in unflattened buffers
@@ -851,25 +840,24 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         start = 0
         for param in param_list:
-            src = param.ds_tensor
-            dest = flat_buffer.narrow(0, start, src.ds_numel)
-            start = start + src.ds_numel
+            dst = flat_buffer.narrow(0, start, param.ds_tensor.ds_numel)
             '''if the parameter was initialized in nvme then bring it to the destination buffer directly'''
-            if src.status == PartitionedParamStatus.NOT_AVAILABLE:
+            if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
                 print_rank_0(
                     f"Swapping in {param.ds_id} with partition size {param.ds_tensor.ds_numel} permanently to CPU"
                 )
-                param.nvme_swapper.swap_into_buffer(param, dest)
-                src.data = dest.data
-                src.status = PartitionedParamStatus.AVAILABLE
+                param.nvme_swapper.swap_into_buffer(param, dst)
             else:
-                assert src.status == PartitionedParamStatus.AVAILABLE, "Partitioned Parm must be avialable here"
+                assert param.ds_tensor.status == PartitionedParamStatus.AVAILABLE, "Partitioned Parm must be avialable here"
                 if not avoid_copy:
-                    dest.data.copy_(src.data)
-                src.data = dest.data
+                    dst.data.copy_(param.ds_tensor.data)
+            param.ds_tensor.data = dst.data
+            param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
 
             # Final location must be gpu/cpu in this case
             param.ds_tensor.final_location = 'not-nvme'
+
+            start += param.ds_tensor.ds_numel
 
     def _create_param_groups_fp16_flat_cpu_memory(self):
 
@@ -904,137 +892,123 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     torch.empty(1,
                                 dtype=self.__param_dtype))
 
-    def _create_fp16_partitions_with_defragmentation(self):
-        dist.barrier()
-        partition_id = dist.get_rank(group=self.dp_process_group)
+    def __create_fp16_partitions_with_defragmentation(self):
         create_fp16_flat_reuse_buffer = False
         largest_partition_numel = []
         max_partition_numel = 0
 
-        #create a flat CPU memory allocation for each param group
-        if self.offload_param:
-            self._create_param_groups_fp16_flat_cpu_memory()
-
         # loop to deal with groups
-        for j, param_group in enumerate(self.optimizer.param_groups):
-
-            sub_groups = self._create_fp16_sub_groups(param_group['params'])
-            print_rank_0(f'fp16 group {j} has {len(sub_groups)} subgroups', force=False)
+        for param_group_idx, param_group in enumerate(self.optimizer.param_groups):
+            param_subgroups = self._create_fp16_sub_groups(param_group["params"])
 
             flat_offset = 0
-            for sub_group in sub_groups:
-                i = len(self.fp16_groups)
+            for subgroup in param_subgroups:
+                subgroup_global_idx = len(self.__fp16_param_groups)
+                self.sub_group_to_group_id[subgroup_global_idx] = param_group_idx
 
-                # push this group to list before modify
-                self.fp16_groups.append(sub_group)
-                self.sub_group_to_group_id[i] = j
+                self.__fp16_param_groups.append(subgroup)
 
-                # comment out for zero_to_fp32 debug
-                # if torch.distributed.get_rank() == 0:
-                #     for param in self.fp16_groups[i]:
-                #         print(f"{debug_param2name_id_shape(param)} {param.ds_shape}")
-
-                #These are the list of the partitioned parameters
-                self.fp16_partitioned_groups.append(
-                    [param.ds_tensor for param in self.fp16_groups[i]])
-
-                total_elements = sum(
-                    [t.ds_numel for t in self.fp16_partitioned_groups[i]])
-                self.fp16_partitioned_groups_flat_numel.append(total_elements)
-
-                if total_elements > max_partition_numel:
-                    largest_partition_numel = [
-                        t.ds_numel for t in self.fp16_partitioned_groups[i]
-                    ]
-                    max_partition_numel = total_elements
+                subgroup_partitions_elements = sum(t.ds_tensor.ds_numel
+                                                   for t in subgroup)
+                self.fp16_partitioned_groups_flat_numel.append(
+                    subgroup_partitions_elements)
+                if subgroup_partitions_elements > max_partition_numel:
+                    largest_partition_numel = [t.ds_tensor.ds_numel for t in subgroup]
+                    max_partition_numel = subgroup_partitions_elements
 
                 print_rank_0(
-                    f"fp16 group {i} partitioned_param norms : {[param.ds_tensor.norm().item() for param in self.fp16_groups[i]]}"
+                    f"fp16 group {subgroup_global_idx} partitioned_param norms: {[param.ds_tensor.norm().item() for param in subgroup]}"
                 )
 
                 #not sure why apex was cloning the weights before flattening
                 #removing cloning here
-                see_memory_usage(f"Before Flattening param subgroup {i}", force=False)
+                see_memory_usage(
+                    f"Before Flattening param subgroup {subgroup_global_idx}")
 
                 #all partitioned parameters remain in GPU during training
                 if not self.offload_param:
-                    see_memory_usage(f"Before moving param subgroup group {i} to CPU",
-                                     force=False)
+                    see_memory_usage(
+                        f"Before moving param subgroup group {subgroup_global_idx} to CPU"
+                    )
                     #move all the parameters to cpu to free up GPU space for creating flat buffer
-                    move_to_cpu(self.fp16_partitioned_groups[i])
-                    see_memory_usage(f"After moving param subgroup {i} to CPU",
-                                     force=False)
+                    move_to_cpu([p.ds_tensor for p in subgroup])
+                    see_memory_usage(
+                        f"After moving param subgroup {subgroup_global_idx} to CPU")
 
                     #create flat buffer in CPU and move to GPU
                     self.fp16_partitioned_groups_flat.append(
                         self.flatten_dense_tensors_aligned(
-                            self.fp16_partitioned_groups[i],
+                            [p.ds_tensor for p in subgroup],
                             1).cuda(torch.cuda.current_device()))
                     see_memory_usage(
-                        f"After flattening and moving param subgroup {i} to GPU",
-                        force=False)
+                        f"After flattening and moving param subgroup {subgroup_global_idx} to GPU"
+                    )
 
                 #all partitioned parameters are in CPU during training
                 else:
                     print_rank_0(f"Params in nvme and cpu {self.params_in_nvme_and_cpu}")
                     #Flat buffer may not be available for parameters that reside in NVME
-                    if not self.params_in_nvme_and_cpu or flat_offset + total_elements <= self.param_groups_fp16_flat_cpu_memory[
-                            j].numel():
+                    if not self.params_in_nvme_and_cpu or flat_offset + subgroup_partitions_elements <= self.param_groups_fp16_flat_cpu_memory[
+                            param_group_idx].numel():
                         fp16_partitioned_group_flat = self.param_groups_fp16_flat_cpu_memory[
-                            j].narrow(0,
-                                      flat_offset,
-                                      total_elements)
+                            param_group_idx].narrow(0,
+                                                    flat_offset,
+                                                    subgroup_partitions_elements)
                         print_rank_0(
-                            f"Creating a flat buffer for subgroup {i} requiring {total_elements} elements, and cumulative CPU elemets {flat_offset + total_elements}",
+                            f"Creating a flat buffer for subgroup {subgroup_global_idx} requiring {subgroup_partitions_elements} elements, and cumulative CPU elemets {flat_offset + subgroup_partitions_elements}",
                             force=False)
                     #these parameters reside in NVME and
                     elif self.params_in_nvme_and_cpu:
                         fp16_partitioned_group_flat = None
                         print_rank_0(
-                            f"No flat buffer for sub group {i} of {total_elements} elements",
+                            f"No flat buffer for sub group {subgroup_global_idx} of {subgroup_partitions_elements} elements",
                             force=False)
                     else:
                         assert False, "Either params are in nvme, or they are in CPU memory. This code path should not be triggered. Please see you max_params_in_cpu and params_in_nvme configs"
 
                     self.fp16_partitioned_groups_flat.append(fp16_partitioned_group_flat)
-                    flat_offset += total_elements
+                    flat_offset += subgroup_partitions_elements
 
                 # move param to flat buffer for both param offload on/off
-                self._move_to_flat_buffer(self.fp16_groups[i],
-                                          self.fp16_partitioned_groups_flat[i],
-                                          avoid_copy=not self.offload_param)
+                self._move_to_flat_buffer(
+                    subgroup,
+                    self.fp16_partitioned_groups_flat[subgroup_global_idx],
+                    avoid_copy=not self.offload_param)
 
-                see_memory_usage(f"After Flattening param group {i}", force=False)
+                see_memory_usage(f"After Flattening param group {subgroup_global_idx}",
+                                 force=False)
 
                 #create a pinned memory to be used for swapping out params to NVME after optimizer step
                 if self.fp16_partitioned_groups_flat[-1] is None:
                     create_fp16_flat_reuse_buffer = True
 
-                see_memory_usage(f"After Flattening param subgroup {i}", force=False)
+                see_memory_usage(
+                    f"After Flattening param subgroup {subgroup_global_idx}",
+                    force=False)
 
         if create_fp16_flat_reuse_buffer:
             assert len(largest_partition_numel) > 0, f'Unexpected that largest partition is empty'
-            self.fp16_groups[0][0].nvme_swapper.reserve_partitioned_swap_space(
+            self.__fp16_param_groups[0][0].nvme_swapper.reserve_partitioned_swap_space(
                 largest_partition_numel)
 
     def _swap_in_sub_group_to_flat_buffer(self, flat_buffer, sub_group_id):
         offset = 0
-        elements_in_sub_group = sum(
-            [t.ds_numel for t in self.fp16_partitioned_groups[sub_group_id]])
+        elements_in_sub_group = sum(p.ds_tensor.ds_numel
+                                    for p in self.__fp16_param_groups)
         assert (flat_buffer.numel() == elements_in_sub_group)
-        for param, partitioned_param in zip(self.fp16_groups[sub_group_id], self.fp16_partitioned_groups[sub_group_id]):
-            dest = flat_buffer.narrow(0, offset, partitioned_param.ds_numel)
-            if partitioned_param.status == PartitionedParamStatus.NOT_AVAILABLE:
+        for param in self.__fp16_param_groups[sub_group_id]:
+            dest = flat_buffer.narrow(0, offset, param.ds_tensor.ds_numel)
+            if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
                 print_rank_0(
                     f"Swapping in {param.ds_id} with elements {param.ds_numel} and partition {param.ds_tensor.ds_numel}"
                 )
                 param.nvme_swapper.swap_in([param], async_op=False)
-                dest.data.copy_(partitioned_param.data)
+                dest.data.copy_(param.ds_tensor.data)
                 param.nvme_swapper.remove_partition_and_release_buffers([param])
                 print_rank_0(f"Swapping in {param.ds_id} done")
             else:
-                dest.data.copy_(partitioned_param.data)
-            offset += partitioned_param.ds_numel
+                dest.data.copy_(param.ds_tensor.data)
+            offset += param.ds_tensor.ds_numel
 
     def _create_next_swappable_fp32_groups(self):
         reverse_order_indices = [
@@ -1052,17 +1026,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def _get_sub_group_partitions(self, sub_group_id):
         sub_group_partitions = []
-        for param, partitioned_param in zip(self.fp16_groups[sub_group_id], self.fp16_partitioned_groups[sub_group_id]):
-            if partitioned_param.status == PartitionedParamStatus.NOT_AVAILABLE:
-                swap_path = param.nvme_swapper.get_path(param, True)
-                sub_group_partitions.append((partitioned_param,
-                                             param.ds_tensor.ds_numel,
-                                             swap_path))
-            else:
-                sub_group_partitions.append((partitioned_param,
-                                             partitioned_param.ds_numel,
-                                             None))
-
+        for param in self.__fp16_param_groups[sub_group_id]:
+            sub_group_partitions.append(
+                (param.ds_tensor,
+                 param.ds_tensor.ds_numel,
+                 param.nvme_swapper.get_path(param,
+                                             True)
+                 if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE else
+                 None))
         return sub_group_partitions
 
     def _create_fp32_partitions(self):
@@ -1139,7 +1110,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 src_tensors=swappable_fp16_src_tensors)
 
         if len(nvme_fp32_dest_tensors) > 0:
-            fp16_pinned_buffers = self.fp16_groups[0][
+            fp16_pinned_buffers = self.__fp16_param_groups[0][
                 0].nvme_swapper.reserve_available_buffers()
             assert len(fp16_pinned_buffers) > 0
             self.optimizer_swapper.initialize_from_swapped_fp16_params(
@@ -1147,7 +1118,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 fp16_num_elems=nvme_fp16_num_elems,
                 fp16_pinned_buffers=fp16_pinned_buffers,
                 fp32_parameters=nvme_fp32_dest_tensors)
-            self.fp16_groups[0][0].nvme_swapper.release_reserved_buffers()
+            self.__fp16_param_groups[0][0].nvme_swapper.release_reserved_buffers()
 
         nvme_gigabytes = nvme_memory_usage / GIGA_BYTES
         print_rank_0(
@@ -1353,7 +1324,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
-        fp16_param = self.fp16_partitioned_groups_flat[sub_group_id]
         self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
 
         self.optimizer.step()
@@ -1375,14 +1345,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         swap_fp16_params = []
         swap_fp32_params = []
-        for param, partitioned_param in zip(self.fp16_groups[i], self.fp16_partitioned_groups[i]):
-            src = fp32_param.narrow(0, offset, partitioned_param.ds_numel)
-            if partitioned_param.status == PartitionedParamStatus.AVAILABLE:
-                partitioned_param.data.copy_(src.data)
+        for param in self.__fp16_param_groups[i]:
+            src = fp32_param.narrow(0, offset, param.ds_tensor.ds_numel)
+            if param.ds_tensor.status == PartitionedParamStatus.AVAILABLE:
+                param.ds_tensor.data.copy_(src.data)
             else:
                 swap_fp32_params.append(src)
                 swap_fp16_params.append(param)
-            offset += partitioned_param.ds_numel
+            offset += param.ds_tensor.ds_numel
 
         if len(swap_fp16_params):
             swap_fp16_params[0].nvme_swapper.swap_out_partitioned_params(
@@ -1390,10 +1360,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 src_fp32_params=swap_fp32_params)
 
     def initialize_optimizer_states(self):
-        num_subgroups = len(self.fp16_groups)
+        num_subgroups = len(self.__fp16_param_groups)
 
         largest_numel = max(
-            [sum([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])
+            sum(p.ds_tensor.ds_numel for p in psg) for psg in self.__fp16_param_groups)
         gradient_dtype = self.fp32_partitioned_groups_flat[0].dtype
         gradient_buffer = torch.zeros(int(largest_numel),
                                       dtype=gradient_dtype,
@@ -1409,7 +1379,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         timer_names.add(INIT_OPTIMIZER_TIMER)
         self.start_timers([INIT_OPTIMIZER_TIMER])
 
-        for i, group in enumerate(self.fp16_groups):
+        for i, group in enumerate(self.__fp16_param_groups):
             swappable_optimizer_subgroup = self._swappable_optimizer_subgroup(i)
             swappable_param_subgroup = self.fp16_partitioned_groups_flat[i] is None
 
@@ -1474,7 +1444,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         #in case of cpu offload, averaged gradients are already in fp32_partitioned_groups_flat.grad
         #TODO: use a similar code path for both cpu_offload and non-cpu offload
         if not self.offload_optimizer:
-            for i, sub_group in enumerate(self.fp16_groups):
+            for i, sub_group in enumerate(self.__fp16_param_groups):
                 self.averaged_gradients[i] = [
                     torch.zeros_like(param.ds_tensor) if param.grad is None else
                     param.grad.data.narrow(0,
@@ -1497,7 +1467,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def __init_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
         self.grad_accs = []
-        for i, param_group in enumerate(self.fp16_groups):
+        for i, param_group in enumerate(self.__fp16_param_groups):
             for param in param_group:
                 if param.requires_grad:
                     #print_rank_0(f" Before all gather {param.device}, {param.shape}")
@@ -1599,7 +1569,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return tensor
 
     def set_grad_positions(self):
-        for i, group in enumerate(self.fp16_groups):
+        for i, group in enumerate(self.__fp16_param_groups):
             current_offset = 0
             for param in group:
                 param_id = self.get_param_id(param)
@@ -1680,7 +1650,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return total_norm
 
     @instrument_w_nvtx
-    def __reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
+    def __reduce_and_partition_ipg_grads(self, safe_mode: bool = True) -> None:
         params_to_reduce = sorted((param for _,
                                    param,
                                    _ in self.params_in_ipg_bucket),
@@ -1711,7 +1681,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if allocate_grads_in_partition:
             self.grads_in_partition = {}
 
-            for i, group in enumerate(self.fp16_groups):
+            for i, group in enumerate(self.__fp16_param_groups):
                 total_size = sum(p.ds_tensor.ds_numel for p in group)
                 see_memory_usage(
                     f"group {i} before creating {total_size} reduced gradients into partition"
@@ -1810,7 +1780,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         """
         # FP32 grad should never exist.
         # For speed, set model fp16 grad to None by default
-        for group in self.fp16_groups:
+        for group in self.__fp16_param_groups:
             for p in group:
                 if set_grads_to_None:
                     p.grad = None
@@ -1921,15 +1891,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def _get_norm_groups(self):
         norm_groups = []
-        for i, group in enumerate(self.fp16_groups):
+        for i, group in enumerate(self.__fp16_param_groups):
             if self.offload_optimizer:
                 norm_groups.append(
                     self.complete_grad_norm_calculation_for_cpu_offload(
-                        self.fp16_groups[i]))
+                        self.__fp16_param_groups[i]))
             else:
                 norm_groups.append(
                     self.get_grad_norm_direct(self.averaged_gradients[i],
-                                              self.fp16_groups[i]))
+                                              self.__fp16_param_groups[i]))
         return norm_groups
 
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):
@@ -2040,11 +2010,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.fp32_partitioned_groups_flat[sub_group_id].grad = None
 
     def _unflatten_partitioned_parameters(self, sub_group_id):
-        updated_params = self.unflatten(self.fp16_partitioned_groups_flat[sub_group_id],
-                                        self.fp16_partitioned_groups[sub_group_id])
+        updated_params = self.unflatten(
+            self.fp16_partitioned_groups_flat[sub_group_id],
+            [p.ds_tensor for p in self.__fp16_param_groups[sub_group_id]])
 
-        for partitioned_param, q in zip(self.fp16_partitioned_groups[sub_group_id], updated_params):
-            partitioned_param.data = q.data
+        for param, q in zip(self.__fp16_param_groups[sub_group_id], updated_params):
+            param.ds_tensor.data = q.data
 
     def _overflow_clean_up(self, prev_scale):
         see_memory_usage('After overflow before clearing gradients', force=False)
@@ -2125,7 +2096,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.start_timers(['optimizer_step'])
 
         #update parameters one sub group at a time
-        for sub_group_id, group in enumerate(self.fp16_groups):
+        for sub_group_id, group in enumerate(self.__fp16_param_groups):
 
             #prepare optimizer states, gradients and fp32 parameters for update
             self._prepare_sub_group(sub_group_id, timer_names)
@@ -2184,7 +2155,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return False
 
     def has_overflow_partitioned_grads_serial(self):
-        for i in range(len(self.fp16_groups)):
+        for i in range(len(self.__fp16_param_groups)):
             for j, grad in enumerate(self.averaged_gradients[i]):
                 if grad is not None and self._has_inf_or_nan(grad.data, j):
                     return True
@@ -2207,7 +2178,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         else:
             params = []
-            for group in self.fp16_groups:
+            for group in self.__fp16_param_groups:
                 for param in group:
                     params.append(param)
 
@@ -2317,7 +2288,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     cur_scale = property(_get_loss_scale, _set_loss_scale)
 
     def _set_fp32_optimizer_param_groups(self):
-        for sub_group_id, _ in enumerate(self.fp16_groups):
+        for sub_group_id, _ in enumerate(self.__fp16_param_groups):
             param_group_id = self.sub_group_to_group_id[sub_group_id]
             self.optimizer.param_groups[param_group_id]['params'].append(
                 self.fp32_partitioned_groups_flat[sub_group_id])
@@ -2389,10 +2360,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         for sub_group_id in range(len(self.fp16_partitioned_groups_flat)):
             updated_params = self.unflatten(
                 self.fp16_partitioned_groups_flat[sub_group_id],
-                self.fp16_partitioned_groups[sub_group_id])
+                [p.ds_tensor for p in self.__fp16_param_groups[sub_group_id]])
 
-            for partitioned_param, q in zip(self.fp16_partitioned_groups[sub_group_id], updated_params):
-                partitioned_param.data = q.data
+            for param, q in zip(self.__fp16_param_groups[sub_group_id], updated_params):
+                param.ds_tensor.data = q.data
 
     # TODO: Support different/changing load/save DP degree.
     def load_state_dict(self, state_dict_list, load_optimizer_states=True):
