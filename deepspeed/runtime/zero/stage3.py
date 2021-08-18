@@ -9,9 +9,8 @@ import os
 import collections
 from collections import OrderedDict, UserDict
 import itertools
-from typing import Dict, Iterable, Set, Tuple
+from typing import Dict, Iterable, Set
 import torch
-from torch.distributed.distributed_c10d import _get_global_rank
 from torch.nn import Module, Parameter
 from torch.optim.optimizer import Optimizer
 import torch.distributed as dist
@@ -629,16 +628,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # end of the optimizer step and will be kept till the end of the backward pass
         # TODO maybe worth just replicating these parameters and doing all reduce for them
         self.__persistent_parameters = []
-        total_persistent_parameters = 0
-        params_count = 0
-        for _, param in self.module.named_parameters(recurse=True):
-            if param.ds_numel < param_persistence_threshold:
-                params_count += 1
-                param.ds_persist = True
-                self.__persistent_parameters.append(param)
-                total_persistent_parameters += param.ds_numel
+        for param in filter(lambda p: p.ds_numel < param_persistence_threshold,
+                            iter_params(self.module,
+                                        recurse=True)):
+            param.ds_persist = True
+            self.__persistent_parameters.append(param)
         print_rank_0(
-            f"ZeRO 3: Total persistent parameters: {total_persistent_parameters} in {params_count} params",
+            f"ZeRO 3: Total persistent parameters: {sum(p.ds_numel for p in self.__persistent_parameters)} in {len(self.__persistent_parameters)} params",
             force=False)
 
         self.setup_zero_stage3_hooks()
@@ -690,18 +686,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.fp32_partitioned_groups_flat = []
         self.next_swappable_fp32_partitioned_groups = []
 
-        self.sub_group_size = sub_group_size
-
         self.sub_group_to_group_id = {}
         see_memory_usage("Before creating fp16 partitions", force=False)
         #create a flat CPU memory allocation for each param group
         dist.barrier()
         if self.offload_param:
             self._create_param_groups_fp16_flat_cpu_memory()
-        self.__create_fp16_partitions_with_defragmentation()
-        num_fp16_subgroups = len(self.fp16_partitioned_groups_flat)
-        see_memory_usage(f"After creating fp16 partitions: {num_fp16_subgroups}",
-                         force=False)
+        self.__create_fp16_partitions_with_defragmentation(sub_group_size)
+        see_memory_usage(
+            f"After creating fp16 partitions: {len(self.fp16_partitioned_groups_flat)}")
 
         # Optimizer ensor swapping
         if self.swap_optimizer:
@@ -720,37 +713,33 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
 
-        if dist.get_rank() == 0:
-            logger.info(f"optimizer state initialized")
-
+        # IPG
         self.reduce_bucket_size = int(reduce_bucket_size)
-
-        self.callback_queued = False
-
-        self.param_dict = {}
-
         self.__ipg_bucket_flat_buffer: Tensor = None
         self.__params_in_ipg_bucket: List[Parameter] = []
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
         self.is_gradient_accumulation_boundary: bool = True
 
-        # simplified param id
+        # Unique ID for each parameter
         self.param_id = {}
-
         count = 0
-        for i, params_group in enumerate(self.__fp16_param_groups):
+        for params_group in self.__fp16_param_groups:
             for param in params_group:
-                unique_id = id(param)
-                self.param_id[unique_id] = count
-                self.param_dict[count] = param
-                count = count + 1
+                self.param_id[id(param)] = count
+                count += 1
 
-        see_memory_usage(f"Before Set Grad positions", force=False)
-        self.grad_position = {}
-        self.set_grad_positions()
+        # map each parameter to its group index and its offset within that group's
+        # flattened buffer
+        self.__param_id_to_param_group_and_offset_within_group_buffer = {}
+        for group_idx, group in enumerate(self.__fp16_param_groups):
+            offset_within_group = 0
+            for param in group:
+                self.__param_id_to_param_group_and_offset_within_group_buffer[
+                    self.get_param_id(param)] = (group_idx,
+                                                 offset_within_group)
+                offset_within_group += param.ds_tensor.ds_numel
 
         see_memory_usage(f"Before CPU Offload initialization", force=False)
-
         if self.offload_optimizer:
             self.accumulated_grads_in_cpu = {}
             self.norm_for_param_grads = {}
@@ -787,10 +776,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             self.dynamic_loss_scale = True
 
-        self.debug_fp16_grads = [{} for _ in self.__fp16_param_groups]
-
-        if dist.get_rank(group=self.dp_process_group) == 0:
-            see_memory_usage(f"After initializing ZeRO optimizer", force=False)
+        see_memory_usage(f"After initializing ZeRO optimizer", force=False)
 
     def _configure_tensor_swapping(self, offload_optimizer_config, aio_config):
         nvme_swap_folder = os.path.join(
@@ -887,14 +873,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     torch.empty(1,
                                 dtype=self.__param_dtype))
 
-    def __create_fp16_partitions_with_defragmentation(self):
+    def __create_fp16_partitions_with_defragmentation(self, subgroup_size: int) -> None:
         create_fp16_flat_reuse_buffer = False
         largest_partition_numel = []
         max_partition_numel = 0
 
         # loop to deal with groups
         for param_group_idx, param_group in enumerate(self.optimizer.param_groups):
-            param_subgroups = self._create_fp16_sub_groups(param_group["params"])
+            param_subgroups = self._create_fp16_sub_groups(param_group["params"],
+                                                           subgroup_size)
 
             flat_offset = 0
             for subgroup in param_subgroups:
@@ -1134,10 +1121,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         for param_group in self.optimizer.param_groups:
             param_group['params'] = []
 
-    def _create_fp16_sub_groups(self, params_group):
-
+    def _create_fp16_sub_groups(self,
+                                params_group: List[Parameter],
+                                sub_group_size: int) -> List[List[Parameter]]:
         params_group_numel = sum([param.partitioned_size() for param in params_group])
-        sub_group_size = self.sub_group_size
 
         if sub_group_size is None or sub_group_size >= params_group_numel:
             return [params_group]
@@ -1159,12 +1146,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 local_sub_group_size = 0
 
         return sub_groups
-
-    # def reset_ds_tensor(self):
-    #     for name, param in self.module.named_parameters(recurse=True):
-    #         assert hasattr(param,'ds_id'), "Parameters have not been converted to be Zero 3 compatible"
-    #         assert (param.ds_status == ZeroParamStatus.NOT_AVAILABLE), "All the parameters must have been partitioned by now"
-    #         param.ds_tensor.data = param.data
 
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
@@ -1435,7 +1416,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if not self.offload_optimizer:
             for i, sub_group in enumerate(self.__fp16_param_groups):
                 self.averaged_gradients[i] = [
-                    torch.zeros_like(param.ds_tensor) if param.grad is None else
+                    torch.zeros_like(param.ds_tensor) if not param.requires_grad else
                     param.grad.data.narrow(0,
                                            0,
                                            param.ds_tensor.numel())
@@ -1457,32 +1438,22 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def __init_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
-        self.grad_accs = []
-        for i, param_group in enumerate(self.__fp16_param_groups):
-            for param in param_group:
-                if param.requires_grad:
-                    #print_rank_0(f" Before all gather {param.device}, {param.shape}")
+        for param_group in self.__fp16_param_groups:
+            for param in filter(lambda p: p.requires_grad, param_group):
+                param.all_gather()  # hook must be created in un-partitioned parameter
 
-                    # The hook must be created in un-partitioned parameter
-                    param.all_gather()
+                def wrapper(param: Parameter):
+                    @instrument_w_nvtx
+                    def reduce_partition_and_remove_grads(*notneeded):
+                        self.reduce_independent_p_g_buckets_and_remove_grads(param)
 
-                    #print(f"After all gather {param.device}, {param.shape}")
-                    def wrapper(param, i):
-                        param_tmp = param.expand_as(param)
-                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    param_tmp = param.expand_as(param)
+                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    grad_acc.register_hook(reduce_partition_and_remove_grads)
 
-                        @instrument_w_nvtx
-                        def reduce_partition_and_remove_grads(*notneeded):
-                            self.reduce_independent_p_g_buckets_and_remove_grads(param)
+                wrapper(param)
 
-                        grad_acc.register_hook(reduce_partition_and_remove_grads)
-                        self.grad_accs.append(grad_acc)
-
-                    #print(f"param grad fn {param.expand_as(param).grad_fn}")
-                    wrapper(param, i)
-
-                    # Partition the parameter after creating the hook
-                    param.partition()
+                param.partition()  # re-partition parameter after creating the hook
         print_rank_0(f'[End] Create gradient reduction hooks')
 
     def get_param_id(self, param):
@@ -1553,21 +1524,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             tensor.copy_(tensor_to_allreduce)
 
         return tensor
-
-    def set_grad_positions(self):
-        for i, group in enumerate(self.__fp16_param_groups):
-            current_offset = 0
-            for param in group:
-                param_id = self.get_param_id(param)
-                num_elements = param.ds_tensor.ds_numel
-
-                self.grad_position[param_id] = [
-                    int(i),
-                    int(current_offset),
-                    int(num_elements)
-                ]
-                #print(f"param id {param_id} i:{i}, ds_tensor {num_elements} numel {param.numel()}")
-                current_offset += num_elements
 
     def async_accumulate_grad_in_cpu_via_gpu(self, param, acc_grad_cpu_partition):
 
@@ -1704,7 +1660,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             for param in params_to_release:
                 param_id = self.get_param_id[param]
-                i, dest_offset, num_elements = self.grad_position[param_id]
+                i, dest_offset = self.__param_id_to_param_group_and_offset_within_group_buffer[param_id]
+                num_elements = param.ds_tensor.ds_numel
                 param.partition_gradients(partition_buffers=self.temp_grad_gpu_buffer)
                 if self.gradient_accumulation_steps > 1:
                     # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
