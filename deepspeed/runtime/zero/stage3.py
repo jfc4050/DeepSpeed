@@ -729,13 +729,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.param_dict = {}
 
-        # map between param_id and bool to specify if a param is in this partition
-        self.is_param_in_current_partition = {}
-
         self.extra_large_param_to_reduce: Parameter = None
         self.params_in_ipg_bucket: List[Tuple[int, Parameter, int]] = []
         self.is_gradient_accumulation_boundary = True
         self.ipg_buffer: Tensor = None
+        self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
+
         self._release_ipg_buffers()
 
         # simplified param id
@@ -754,8 +753,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.set_grad_positions()
 
         see_memory_usage(f"Before CPU Offload initialization", force=False)
-
-        self.grads_in_partition: Dict[int, Tensor] = None
 
         if self.offload_optimizer:
             self.accumulated_grads_in_cpu = {}
@@ -1317,7 +1314,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def _release_ipg_buffers(self):
         self.ipg_buffer = None
         if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
-            self.grads_in_partition = None
+            self.__param_id_to_grad_partition.clear()
 
     @instrument_w_nvtx
     def _optimizer_step(self, sub_group_id):
@@ -1672,47 +1669,43 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if not params_to_release:
             return
 
-        if self.offload_optimizer:
-            allocate_grads_in_partition = self.grads_in_partition is None\
-            and self.gradient_accumulation_steps > 1
-        else:
-            allocate_grads_in_partition = self.grads_in_partition is None
-
-        if allocate_grads_in_partition:
-            self.grads_in_partition = {}
-
+        if not self.__param_id_to_grad_partition and (
+                not self.offload_optimizer or self.gradient_accumulation_steps > 1):
             for i, group in enumerate(self.__fp16_param_groups):
-                total_size = sum(p.ds_tensor.ds_numel for p in group)
+                numel_of_grad_partitions_in_param_group = sum(p.ds_tensor.ds_numel
+                                                              for p in group)
                 see_memory_usage(
-                    f"group {i} before creating {total_size} reduced gradients into partition"
+                    f"group {i} before creating {numel_of_grad_partitions_in_param_group} reduced gradients into partition"
                 )
-                buffer: Tensor = torch.zeros(int(total_size),
-                                             dtype=self.__param_dtype,
-                                             device=self.device,
-                                             pin_memory=self.offload_param_pin_memory)
+                grad_partitions_in_param_group_flat_buffer: Tensor = torch.zeros(
+                    numel_of_grad_partitions_in_param_group,
+                    dtype=self.__param_dtype,
+                    device=self.device,
+                    pin_memory=self.offload_param_pin_memory)
                 see_memory_usage(
-                    f"group {i} after creating {total_size} reduced gradients into partition"
+                    f"group {i} after creating {numel_of_grad_partitions_in_param_group} reduced gradients into partition"
                 )
+                offset = 0
                 for param in group:
                     param_id = self.get_param_id(param)
-                    i, dst_offset, num_elements = self.grad_position[param_id]
-                    self.grads_in_partition[param_id] = buffer.narrow(
-                        0,
-                        dst_offset,
-                        num_elements)
+                    self.__param_id_to_grad_partition[
+                        param_id] = grad_partitions_in_param_group_flat_buffer.narrow(
+                            0,
+                            offset,
+                            param.ds_tensor.ds_numel)
+                    offset += param.ds_tensor.ds_numel
 
         if self.offload_optimizer:
             offload_fp32_gradients = {}
             offload_fp32_offsets = {}
 
-        for param in params_to_release:
-            param_id = self.get_param_id(param)
-            if self.offload_optimizer:
+            for param in params_to_release:
+                param_id = self.get_param_id[param]
                 i, dest_offset, num_elements = self.grad_position[param_id]
                 param.partition_gradients(partition_buffers=self.temp_grad_gpu_buffer)
                 if self.gradient_accumulation_steps > 1:
                     # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
-                    fp16_grad_tensor = self.grads_in_partition[param_id]
+                    fp16_grad_tensor = self.__param_id_to_grad_partition[param_id]
                     self.async_accumulate_grad_in_cpu_via_gpu(param, fp16_grad_tensor)
 
                 if self.is_gradient_accumulation_boundary:
@@ -1738,18 +1731,18 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         fp32_grad_tensor.copy_(param.grad.view(-1).float(),
                                                non_blocking=True)
                         param.grad = None
-            else:
-                # allreduce buffer will be rewritten. copy gradients in partition to new buffer
+            if self.swap_optimizer:
+                for i in offload_fp32_gradients.keys():
+                    self.optimizer_swapper.swap_out_gradients(
+                        parameter=self.fp32_partitioned_groups_flat[i],
+                        gradient_offsets=offload_fp32_offsets[i],
+                        gradient_tensors=offload_fp32_gradients[i])
+        else:
+            for param in params_to_release:
                 param.partition_gradients(
-                    partition_buffers=self.grads_in_partition[param_id],
+                    partition_buffers=self.__param_id_to_grad_partition[
+                        self.get_param_id(param)],
                     accumulate=self.micro_step_id > 0)
-
-        if self.offload_optimizer and self.swap_optimizer:
-            for i in offload_fp32_gradients.keys():
-                self.optimizer_swapper.swap_out_gradients(
-                    parameter=self.fp32_partitioned_groups_flat[i],
-                    gradient_offsets=offload_fp32_offsets[i],
-                    gradient_tensors=offload_fp32_gradients[i])
 
     @instrument_w_nvtx
     def __reduce_grads(self, params_to_reduce: List[Parameter]) -> None:
