@@ -729,11 +729,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.param_dict = {}
 
-        self.extra_large_param_to_reduce: Parameter = None
-        self.params_in_ipg_bucket: List[Tuple[int, Parameter, int]] = []
-        self.is_gradient_accumulation_boundary = True
-        self.ipg_buffer: Tensor = None
+        self.__extra_large_param_to_reduce: Parameter = None
+        self.__ipg_bucket_flat_buffer: Tensor = None
+        self.__params_in_ipg_bucket: List[Parameter] = []
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
+        self.is_gradient_accumulation_boundary: bool = True
 
         self._release_ipg_buffers()
 
@@ -819,8 +819,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             timers=self.timers)
 
     @property
-    def elements_in_ipg_bucket(self):
-        return sum(p.ds_numel for _, p, _ in self.params_in_ipg_bucket)
+    def __elements_in_ipg_bucket(self):
+        return sum(p.ds_numel for p in self.__params_in_ipg_bucket)
 
     def _move_to_flat_buffer(self,
                              param_list: List[Parameter],
@@ -1312,7 +1312,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         module.register_forward_pre_hook(_post_backward_module_hook)
 
     def _release_ipg_buffers(self):
-        self.ipg_buffer = None
+        self.__ipg_bucket_flat_buffer = None
         if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
             self.__param_id_to_grad_partition.clear()
 
@@ -1498,10 +1498,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return self.param_id[unique_id]
 
     def report_ipg_memory_usage(self, tag, param_elems):
-        elem_count = self.elements_in_ipg_bucket + param_elems
+        elem_count = self.__elements_in_ipg_bucket + param_elems
         percent_of_bucket_size = (100.0 * elem_count) // self.reduce_bucket_size
         see_memory_usage(
-            f"{tag}: elems in_bucket {self.elements_in_ipg_bucket} param {param_elems} max_percent {percent_of_bucket_size}",
+            f"{tag}: elems in_bucket {self.__elements_in_ipg_bucket} param {param_elems} max_percent {percent_of_bucket_size}",
             force=False)
 
     ###############Idependent Partition Gradient ########################
@@ -1516,7 +1516,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
         # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
         # empty, while reduction_list will have that garbage data.
-        if self.elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
+        if self.__elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
             self.__reduce_and_partition_ipg_grads()
@@ -1527,17 +1527,16 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
         if param.ds_numel > self.reduce_bucket_size:
-            self.extra_large_param_to_reduce = param
+            self.__extra_large_param_to_reduce = param
         else:
-            #print_rank_0("before new grad tensor move")
-            new_grad_tensor = self.ipg_buffer.narrow(0,
-                                                     self.elements_in_ipg_bucket,
-                                                     param.ds_numel)
-            #print_rank_0("after new grad tensor move")
+            new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
+                0,
+                self.__elements_in_ipg_bucket,
+                param.ds_numel)
             new_grad_tensor.copy_(param.grad.view(-1))
             param.grad.data = new_grad_tensor.data.view_as(param.grad)
 
-        self.params_in_ipg_bucket.append((i, param, param_id))
+        self.__params_in_ipg_bucket.append(param)
         self.report_ipg_memory_usage("End ipg_remove_grads", 0)
 
     def gradient_reduction_w_predivide(self, tensor):
@@ -1648,21 +1647,36 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def __reduce_and_partition_ipg_grads(self, safe_mode: bool = True) -> None:
-        params_to_reduce = sorted((param for _,
-                                   param,
-                                   _ in self.params_in_ipg_bucket),
-                                  key=lambda p: p.ds_id)
-        if self.extra_large_param_to_reduce is not None:
-            params_to_reduce.append(self.extra_large_param_to_reduce)
-        self.params_in_ipg_bucket.clear()
-        self.extra_large_param_to_reduce = None
+        params_to_reduce = self.__params_in_ipg_bucket.copy()
+        if self.__extra_large_param_to_reduce is not None:
+            params_to_reduce.append(self.__extra_large_param_to_reduce)
+            self.__extra_large_param_to_reduce = None
+        self.__params_in_ipg_bucket.clear()
+        params_to_reduce.sort(key=lambda p: p.ds_id)
 
         assert len(set(p.ds_id for p in params_to_reduce)) == len(params_to_reduce)
         if safe_mode:
             assert_ints_same_as_other_ranks([p.ds_id for p in params_to_reduce])
 
-        self.__reduce_grads(params_to_reduce)
+        self.__avg_scatter_grads(params_to_reduce)
         self.__partition_grads(params_to_reduce)
+
+    @instrument_w_nvtx
+    def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> None:
+        if not self.reduce_scatter:
+            for param in params_to_reduce:
+                self.gradient_reduction_w_predivide(param.grad)
+            return
+
+        for param in params_to_reduce:
+            param.grad.div_(dist.get_world_size(group=self.dp_process_group))
+
+        # reduction resulting with each rank only holding the gradient partition it owns
+        # This could either be a reduce scatter or a reduce op depending on how
+        # parameters are partitionied. The method is implemented by the
+        # DeepSpeed param extensions to the pytorch parameter, so its up to
+        # the extension to define what happens here
+        params_to_reduce[0].reduce_gradients_at_owner(param_list=params_to_reduce)
 
     @instrument_w_nvtx
     def __partition_grads(self, params_to_release: List[Parameter]) -> None:
@@ -1743,25 +1757,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     partition_buffers=self.__param_id_to_grad_partition[
                         self.get_param_id(param)],
                     accumulate=self.micro_step_id > 0)
-
-    @instrument_w_nvtx
-    def __reduce_grads(self, params_to_reduce: List[Parameter]) -> None:
-        if not self.reduce_scatter:
-            for param in params_to_reduce:
-                self.gradient_reduction_w_predivide(param.grad)
-            return
-
-        for param in params_to_reduce:
-            param.grad.div_(dist.get_world_size(group=self.dp_process_group))
-
-        # reduction resulting with each rank only holding the gradient partition it owns
-        # This could either be a reduce scatter or a reduce op depending on how
-        # parameters are partitionied. The method is implemented by the
-        # DeepSpeed param extensions to the pytorch parameter, so its up to
-        # the extension to define what happens here
-        params_to_reduce[0].reduce_gradients_at_owner(
-            param_list=params_to_reduce,
-            hierarchy=self.param_coordinator.hierarchy)
 
     #############################################################################
     #############################################################################
@@ -2225,10 +2220,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.optimizer_swapper.pre_backward()
 
         see_memory_usage(f"Before backward", force=False)
-        self.ipg_buffer = torch.empty(self.reduce_bucket_size,
-                                      dtype=self.__param_dtype,
-                                      device=torch.cuda.current_device(),
-                                      requires_grad=False)
+        self.__ipg_bucket_flat_buffer = torch.empty(self.reduce_bucket_size,
+                                                    dtype=self.__param_dtype,
+                                                    device=torch.cuda.current_device(),
+                                                    requires_grad=False)
 
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
