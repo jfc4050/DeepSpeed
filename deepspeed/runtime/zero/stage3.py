@@ -681,7 +681,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         # Holds a fused and flattened copy of the parameters
         self.fp16_partitioned_groups_flat = []
-        self.fp16_partitioned_groups_flat_numel = []
 
         #defragmented pinned memory
         self.param_groups_fp16_flat_cpu_memory = []
@@ -815,7 +814,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             aio_config=aio_config,
             base_folder=nvme_swap_folder,
             optimizer=self.optimizer,
-            largest_numel=max(self.fp16_partitioned_groups_flat_numel),
+            largest_numel=max(
+                sum(p.ds_tensor.ds_numel for p in param_subgroup)
+                for param_subgroup in self.__fp16_param_groups),
             device=self.device,
             dtype=torch.float32,
             timers=self.timers)
@@ -910,8 +911,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                 subgroup_partitions_elements = sum(t.ds_tensor.ds_numel
                                                    for t in subgroup)
-                self.fp16_partitioned_groups_flat_numel.append(
-                    subgroup_partitions_elements)
                 if subgroup_partitions_elements > max_partition_numel:
                     largest_partition_numel = [t.ds_tensor.ds_numel for t in subgroup]
                     max_partition_numel = subgroup_partitions_elements
@@ -1055,7 +1054,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         fp32_element_size = torch.tensor([], dtype=torch.float32).element_size()
 
         for i, tensor in enumerate(self.fp16_partitioned_groups_flat):
-            num_elements = self.fp16_partitioned_groups_flat_numel[i]
+            num_elements = sum(p.ds_tensor.ds_numel for p in self.__fp16_param_groups[i])
 
             # a partition of the fp32 master weights that will be updated by this process
             if self._swappable_optimizer_subgroup(i):
@@ -1335,7 +1334,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return self.optimizer_swapper.swappable_tensor(
             None,
-            numel=self.fp16_partitioned_groups_flat_numel[sub_group_id])
+            numel=sum(p.ds_tensor.ds_numel
+                      for p in self.__fp16_param_groups[sub_group_id]))
 
     def _partitioned_params_swap_out(self, i):
         offset = 0
@@ -1383,7 +1383,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             swappable_optimizer_subgroup = self._swappable_optimizer_subgroup(i)
             swappable_param_subgroup = self.fp16_partitioned_groups_flat[i] is None
 
-            num_elements = int(self.fp16_partitioned_groups_flat_numel[i])
+            num_elements = sum(p.ds_tensor.ds_numel for p in self.__fp16_param_groups[i])
 
             see_memory_usage(
                 f'[Begin] Initialize optimizer states {i} / {num_subgroups} subgroups, num_elems: {num_elements}, swappable opt/param:{swappable_optimizer_subgroup}/{swappable_param_subgroup}',
@@ -1930,7 +1930,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                          force=False)
 
     def _optimizer_states_and_gradient_swap_in(self, sub_group_id, timer_names=set()):
-        param_length = self.fp16_partitioned_groups_flat_numel[sub_group_id]
+        param_length = sum(p.ds_tensor.ds_numel
+                           for p in self.__fp16_param_groups[sub_group_id])
         fp32_param_id = id(self.fp32_partitioned_groups_flat[sub_group_id])
         assert self._swappable_optimizer_subgroup(sub_group_id), \
             f'Parameter {fp32_param_id} of numel={param_length} is not swappable'
@@ -1984,7 +1985,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return self.flatten(padded_tensor_list)
 
     def _optimizer_states_and_gradient_swap_out(self, sub_group_id, timer_names=set()):
-        param_length = self.fp16_partitioned_groups_flat_numel[sub_group_id]
+        param_length = sum(p.ds_tensor.ds_numel
+                           for p in self.__fp16_param_groups[sub_group_id])
         fp32_param_id = id(self.fp32_partitioned_groups_flat[sub_group_id])
         assert self._swappable_optimizer_subgroup(sub_group_id), \
             f'Parameter {fp32_param_id} of numel={param_length} is not swappable'
