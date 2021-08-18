@@ -734,8 +734,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
         self.is_gradient_accumulation_boundary: bool = True
 
-        self._release_ipg_buffers()
-
         # simplified param id
         self.param_id = {}
 
@@ -1310,11 +1308,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         module.register_forward_hook(_pre_backward_module_hook)
         module.register_forward_pre_hook(_post_backward_module_hook)
 
-    def _release_ipg_buffers(self):
-        self.__ipg_bucket_flat_buffer = None
-        if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
-            self.__param_id_to_grad_partition.clear()
-
     @instrument_w_nvtx
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
@@ -1454,7 +1447,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 #     self.fp32_partitioned_groups_flat[i].numel(),
                 #     return_tensor_list=True)
 
-        self._release_ipg_buffers()
+        self.__ipg_bucket_flat_buffer = None
+        if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
+            self.__param_id_to_grad_partition.clear()
 
         see_memory_usage(f"End ipg_epilogue", force=False)
 
