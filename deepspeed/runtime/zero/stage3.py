@@ -729,7 +729,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.param_dict = {}
 
-        self.__extra_large_param_to_reduce: Parameter = None
         self.__ipg_bucket_flat_buffer: Tensor = None
         self.__params_in_ipg_bucket: List[Parameter] = []
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
@@ -1479,9 +1478,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            self.reduce_independent_p_g_buckets_and_remove_grads(
-                                param,
-                                i)
+                            self.reduce_independent_p_g_buckets_and_remove_grads(param)
 
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
@@ -1506,35 +1503,33 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     ###############Idependent Partition Gradient ########################
     @instrument_w_nvtx
-    def reduce_independent_p_g_buckets_and_remove_grads(self,
-                                                        param: Parameter,
-                                                        i: int) -> None:
-        #print_rank_0(f"Inside reduce ipg buckets. {debug_param2name_id_shape(param)}, ipg elements {self.elements_in_ipg_bucket}, reduce bucket size {self.reduce_bucket_size}", force=True)
+    def reduce_independent_p_g_buckets_and_remove_grads(self, param: Parameter) -> None:
+        if param.ds_numel > self.__ipg_bucket_flat_buffer.numel():
+            # TODO. in future just dynamically allocate this
+            raise RuntimeError(
+                f"param ds_numel {param.ds_numel} too large for buffer of size {self.__ipg_bucket_flat_buffer.numel()}. please increase size of reduce bucket"
+            )
 
         # Because the ipg bucket is initialized with a random place holder tensor, we must
         # explicitly check that the bucket has any real data in it (self.elements_in_ipg_bucket >
         # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
         # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
         # empty, while reduction_list will have that garbage data.
-        if self.__elements_in_ipg_bucket + param.ds_numel > self.reduce_bucket_size:
+        if self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
+        ):
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
             self.__reduce_and_partition_ipg_grads()
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads",
                                          param.ds_numel)
 
-        param_id = self.get_param_id(param)
-
-        # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
-        if param.ds_numel > self.reduce_bucket_size:
-            self.__extra_large_param_to_reduce = param
-        else:
-            new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
-                0,
-                self.__elements_in_ipg_bucket,
-                param.ds_numel)
-            new_grad_tensor.copy_(param.grad.view(-1))
-            param.grad.data = new_grad_tensor.data.view_as(param.grad)
+        # move the parameter's gradient to the contiguous flat buffer
+        new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
+            0,
+            self.__elements_in_ipg_bucket,
+            param.ds_numel)
+        new_grad_tensor.copy_(param.grad.view(-1))
+        param.grad.data = new_grad_tensor.data.view_as(param.grad)
 
         self.__params_in_ipg_bucket.append(param)
         self.report_ipg_memory_usage("End ipg_remove_grads", 0)
@@ -1647,19 +1642,18 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def __reduce_and_partition_ipg_grads(self, safe_mode: bool = True) -> None:
-        params_to_reduce = self.__params_in_ipg_bucket.copy()
-        if self.__extra_large_param_to_reduce is not None:
-            params_to_reduce.append(self.__extra_large_param_to_reduce)
-            self.__extra_large_param_to_reduce = None
-        self.__params_in_ipg_bucket.clear()
-        params_to_reduce.sort(key=lambda p: p.ds_id)
+        self.__params_in_ipg_bucket.sort(key=lambda p: p.ds_id)
 
-        assert len(set(p.ds_id for p in params_to_reduce)) == len(params_to_reduce)
+        assert len(set(p.ds_id for p in self.__params_in_ipg_bucket)) == len(
+            self.__params_in_ipg_bucket)
         if safe_mode:
-            assert_ints_same_as_other_ranks([p.ds_id for p in params_to_reduce])
+            assert_ints_same_as_other_ranks(
+                [p.ds_id for p in self.__params_in_ipg_bucket])
 
-        self.__avg_scatter_grads(params_to_reduce)
-        self.__partition_grads(params_to_reduce)
+        self.__avg_scatter_grads(self.__params_in_ipg_bucket)
+        self.__partition_grads(self.__params_in_ipg_bucket)
+
+        self.__params_in_ipg_bucket.clear()
 
     @instrument_w_nvtx
     def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> None:
