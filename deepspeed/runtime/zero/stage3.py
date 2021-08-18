@@ -1438,22 +1438,32 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def __init_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
-        for param_group in self.__fp16_param_groups:
-            for param in filter(lambda p: p.requires_grad, param_group):
-                param.all_gather()  # hook must be created in un-partitioned parameter
+        self.grad_accs = []
+        for i, param_group in enumerate(self.__fp16_param_groups):
+            for param in param_group:
+                if param.requires_grad:
+                    #print_rank_0(f" Before all gather {param.device}, {param.shape}")
 
-                def wrapper(param: Parameter):
-                    @instrument_w_nvtx
-                    def reduce_partition_and_remove_grads(*notneeded):
-                        self.reduce_independent_p_g_buckets_and_remove_grads(param)
+                    # The hook must be created in un-partitioned parameter
+                    param.all_gather()
 
-                    param_tmp = param.expand_as(param)
-                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(reduce_partition_and_remove_grads)
+                    #print(f"After all gather {param.device}, {param.shape}")
+                    def wrapper(param, i):
+                        param_tmp = param.expand_as(param)
+                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
 
-                wrapper(param)
+                        @instrument_w_nvtx
+                        def reduce_partition_and_remove_grads(*notneeded):
+                            self.reduce_independent_p_g_buckets_and_remove_grads(param)
 
-                param.partition()  # re-partition parameter after creating the hook
+                        grad_acc.register_hook(reduce_partition_and_remove_grads)
+                        self.grad_accs.append(grad_acc)
+
+                    #print(f"param grad fn {param.expand_as(param).grad_fn}")
+                    wrapper(param, i)
+
+                    # Partition the parameter after creating the hook
+                    param.partition()
         print_rank_0(f'[End] Create gradient reduction hooks')
 
     def get_param_id(self, param):
