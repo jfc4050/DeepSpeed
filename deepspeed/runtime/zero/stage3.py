@@ -2117,24 +2117,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return False
 
     @instrument_w_nvtx
-    def has_overflow_partitioned_grads_serial(self):
-        for i in range(len(self.__fp16_param_groups)):
-            for j, grad in enumerate(self.averaged_gradients[i]):
-                if grad is not None and self._has_inf_or_nan(grad.data, j):
-                    return True
-        return False
-
-    @instrument_w_nvtx
     def has_overflow(self, partition_gradients=True):
         if partition_gradients:
             self.local_overflow = self._has_inf_or_nan(
                 self.__gradient_sum_for_inf_or_nan_tracking)
             self.__gradient_sum_for_inf_or_nan_tracking.zero_()
 
-            overflow = self.local_overflow if self.offload_optimizer else self.has_overflow_partitioned_grads_serial(
-            )
-            #overflow = self.has_overflow_partitioned_grads_serial()
-            overflow_gpu = torch.cuda.ByteTensor([overflow])
+            overflow_gpu = torch.cuda.ByteTensor([self.local_overflow])
             torch.distributed.all_reduce(overflow_gpu,
                                          op=torch.distributed.ReduceOp.MAX,
                                          group=self.dp_process_group)
