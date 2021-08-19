@@ -1843,6 +1843,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         print_rank_0("Finished Tracing at Beginning of Step")
 
+    @instrument_w_nvtx
     def _get_norm_groups(self):
         norm_groups = []
         for i, group in enumerate(self.__fp16_param_groups):
@@ -1873,6 +1874,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.averaged_gradients[sub_group_id] = None
 
+    @instrument_w_nvtx
     def _prepare_sub_group(self, sub_group_id, timer_names=set()):
         see_memory_usage(f'Before prepare optimizer sub group {sub_group_id}',
                          force=False)
@@ -1904,6 +1906,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage(f'pre-step After swapping in optimizer tensors {sub_group_id}',
                          force=False)
 
+    @instrument_w_nvtx
     def _release_sub_group(self, sub_group_id, timer_names=set()):
         see_memory_usage(f'Before release optimizer sub group {sub_group_id}',
                          force=False)
@@ -1991,6 +1994,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                         prev_scale,
                                         self.loss_scale))
 
+    @instrument_w_nvtx
     def _overflow_check_and_loss_scale_update(self):
 
         # First compute norm for all group so we know if there is overflow
@@ -2021,6 +2025,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage('After zero_optimizer step', force=False)
         print_rank_0(f"------------------Finishing Step-----------------------")
 
+    @instrument_w_nvtx
     def _reassign_or_swap_out_partitioned_parameters(self, sub_group_id):
         if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
             self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
@@ -2074,6 +2079,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self._post_step(timer_names)
         return
 
+    @instrument_w_nvtx
     def unscale_and_clip_grads(self, sub_group_id, norm_groups):
 
         grad_groups_flat = [self.fp32_partitioned_groups_flat[sub_group_id].grad]
@@ -2110,6 +2116,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return False
 
+    @instrument_w_nvtx
     def has_overflow_partitioned_grads_serial(self):
         for i in range(len(self.__fp16_param_groups)):
             for j, grad in enumerate(self.averaged_gradients[i]):
