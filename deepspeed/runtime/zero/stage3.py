@@ -713,6 +713,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
 
+        self.__reduce_and_partition_stream = Stream()
+
         # IPG
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.__ipg_bucket_flat_buffer: Tensor = None
@@ -1407,9 +1409,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
-        self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
-        self.__reduce_and_partition_ipg_grads()
-        self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
+        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
+        with torch.cuda.stream(self.__reduce_and_partition_stream):
+            self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
+            self.__reduce_and_partition_ipg_grads()
+            self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
+
+        torch.cuda.synchronize()
 
         #in case of cpu offload, averaged gradients are already in fp32_partitioned_groups_flat.grad
         #TODO: use a similar code path for both cpu_offload and non-cpu offload
@@ -1454,7 +1460,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            self.reduce_independent_p_g_buckets_and_remove_grads(param)
+                            self.__reduce_and_partition_stream.wait_stream(
+                                torch.cuda.default_stream())
+                            with torch.cuda.stream(self.__reduce_and_partition_stream):
+                                self.reduce_independent_p_g_buckets_and_remove_grads(
+                                    param)
 
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
