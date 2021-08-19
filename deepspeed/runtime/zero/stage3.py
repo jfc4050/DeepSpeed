@@ -1612,7 +1612,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return total_norm
 
     @instrument_w_nvtx
-    def __reduce_and_partition_ipg_grads(self, safe_mode: bool = True) -> None:
+    def __reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
         self.__params_in_ipg_bucket.sort(key=lambda p: p.ds_id)
 
         assert len(set(p.ds_id for p in self.__params_in_ipg_bucket)) == len(
