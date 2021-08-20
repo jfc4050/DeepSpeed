@@ -390,21 +390,6 @@ class AllGatherCoalescedHandle:
             replicated_tensor = instrument_w_nvtx(torch.cat)(partitions).view(
                 param.ds_shape)
 
-            # FIXME: not sure why but there is a race condition where a rank will
-            # in rare cases get the wrong values on a parameter, but only within
-            # its own partition.
-            # IE:
-            #    rank0 gets [A0A1]
-            #    rank1 gets [A0B1]
-            # this is kind of weird because only one rank gets a wrong answer,
-            # which indicates the problem is after the allgather.
-            start = torch.distributed.get_rank() * param.ds_tensor.ds_numel
-            if start < param.ds_numel:
-                numel = min(param.ds_tensor.ds_numel, replicated_tensor.numel() - start)
-                src_tensor = param.ds_tensor.narrow(0, 0, numel)
-                dst_tensor = replicated_tensor.view(-1).narrow(0, start, numel)
-                dst_tensor.copy_(src_tensor)
-
             param.data = replicated_tensor.data
             param.ds_status = ZeroParamStatus.AVAILABLE
 
