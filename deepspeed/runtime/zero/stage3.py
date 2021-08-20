@@ -1636,6 +1636,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
             torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
+            # FIXME: why is this required to make the race conditions stop?
+            # when we call wait() on a parameter it already makes this stream wait.
+            # its possible that there are parameters being used here that we haven't
+            # explicitly called wait on yet - maybe a hook execution order or tracing
+            # issue?
+            torch.cuda.current_stream().wait_stream(self.__allgather_stream)
             if safe_mode:
                 assert_ints_same_as_other_ranks(
                     [p.ds_id for p in self.__params_in_ipg_bucket])
