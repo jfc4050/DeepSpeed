@@ -1409,11 +1409,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
-        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
-        with torch.cuda.stream(self.__reduce_and_partition_stream):
-            self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
-            self.__reduce_and_partition_ipg_grads()
-            self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
+        self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
+        self.__reduce_and_partition_ipg_grads()
+        self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
         torch.cuda.synchronize()
 
@@ -1460,11 +1458,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            self.__reduce_and_partition_stream.wait_stream(
-                                torch.cuda.default_stream())
-                            with torch.cuda.stream(self.__reduce_and_partition_stream):
-                                self.reduce_independent_p_g_buckets_and_remove_grads(
-                                    param)
+                            self.reduce_independent_p_g_buckets_and_remove_grads(param)
 
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
@@ -1617,12 +1611,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         assert len(set(p.ds_id for p in self.__params_in_ipg_bucket)) == len(
             self.__params_in_ipg_bucket)
-        if safe_mode:
-            assert_ints_same_as_other_ranks(
-                [p.ds_id for p in self.__params_in_ipg_bucket])
 
-        self.__avg_scatter_grads(self.__params_in_ipg_bucket)
-        self.__partition_grads(self.__params_in_ipg_bucket)
+        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
+        with torch.cuda.stream(self.__reduce_and_partition_stream):
+            if safe_mode:
+                assert_ints_same_as_other_ranks(
+                    [p.ds_id for p in self.__params_in_ipg_bucket])
+
+            self.__avg_scatter_grads(self.__params_in_ipg_bucket)
+            self.__partition_grads(self.__params_in_ipg_bucket)
 
         self.__params_in_ipg_bucket.clear()
 
