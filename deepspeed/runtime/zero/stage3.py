@@ -179,6 +179,7 @@ class PartitionedParameterCoordinator:
             max_reuse_distance_in_numel: int,
             max_available_parameters_in_numel: int,
             allgather_stream: Stream,
+            dependent_streams: Iterable[Stream],
             prefetch_nvme: bool = False,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
@@ -205,7 +206,10 @@ class PartitionedParameterCoordinator:
         self.__prefetch_nvme: bool = prefetch_nvme
         self.hierarchy: int = 0
 
+        # stream that will be used for allgather operations
         self.__allgather_stream: Stream = allgather_stream
+        # streams where the parameters being allgathered will be consumed
+        self.__dependent_streams: Iterable[Stream] = dependent_streams
 
         dist.barrier()
 
@@ -336,7 +340,8 @@ class PartitionedParameterCoordinator:
             info_rank_0(f"-wait: {param.ds_summary()}")
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
 
-        torch.cuda.current_stream().wait_stream(self.__allgather_stream)
+        for stream in self.__dependent_streams:
+            stream.wait_stream(self.__allgather_stream)
 
         self.__step_id += 1
 
@@ -625,7 +630,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         ### streams used for overlapping computation with communication
         self.__allgather_stream = Stream()
-        self.__reduce_and_partition_stream = torch.cuda.default_stream()
+        self.__reduce_and_partition_stream = Stream()
 
         ############################################################################
         self.param_coordinator = PartitionedParameterCoordinator(
@@ -633,6 +638,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             max_reuse_distance_in_numel=int(max_reuse_distance),
             max_available_parameters_in_numel=int(max_live_parameters),
             allgather_stream=self.__allgather_stream,
+            dependent_streams=[
+                torch.cuda.default_stream(),
+                self.__reduce_and_partition_stream
+            ],
             prefetch_nvme=self.params_in_nvme_and_cpu,
         )
 
@@ -1514,15 +1523,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads",
                                          param.ds_numel)
 
-        # move the parameter's gradient to the contiguous flat buffer
-        new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
-            0,
-            self.__elements_in_ipg_bucket,
-            param.ds_numel)
-        new_grad_tensor.copy_(param.grad.view(-1))
-        param.grad.data = new_grad_tensor.data.view_as(param.grad)
+        with torch.cuda.stream(self.__reduce_and_partition_stream):
+            torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
+            # move the parameter's gradient to the contiguous flat buffer
+            new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
+                0,
+                self.__elements_in_ipg_bucket,
+                param.ds_numel)
+            new_grad_tensor.copy_(param.grad.view(-1))
+            param.grad.data = new_grad_tensor.data.view_as(param.grad)
 
-        self.__params_in_ipg_bucket.append(param)
+            self.__params_in_ipg_bucket.append(param)
         self.report_ipg_memory_usage("End ipg_remove_grads", 0)
 
     def gradient_reduction_w_predivide(self, tensor):
@@ -1623,8 +1634,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         assert len(set(p.ds_id for p in self.__params_in_ipg_bucket)) == len(
             self.__params_in_ipg_bucket)
 
-        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
         with torch.cuda.stream(self.__reduce_and_partition_stream):
+            torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
             if safe_mode:
                 assert_ints_same_as_other_ranks(
                     [p.ds_id for p in self.__params_in_ipg_bucket])
