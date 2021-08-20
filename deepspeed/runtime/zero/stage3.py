@@ -629,8 +629,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         ) if not self.offload_optimizer else OFFLOAD_CPU_DEVICE
 
         ### streams used for overlapping computation with communication
-        self.__allgather_stream = Stream()
-        self.__reduce_and_partition_stream = Stream()
+        self.__allgather_stream = Stream(
+        ) if overlap_comm else torch.cuda.default_stream()
+        self.__reduce_and_partition_stream = Stream(
+        ) if overlap_comm else torch.cuda.default_stream()
 
         ############################################################################
         self.param_coordinator = PartitionedParameterCoordinator(
