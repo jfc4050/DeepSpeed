@@ -356,12 +356,10 @@ class AllGatherCoalescedHandle:
             params: List[Parameter],
             partitions: List[Tensor],
             world_size: int,
-            comm_stream: Stream,
     ) -> None:
         self.__params = params
         self.__partitions = partitions
         self.__world_size = world_size
-        self.__comm_stream = comm_stream
         self.__complete = False
 
         for param in self.__params:
@@ -374,47 +372,43 @@ class AllGatherCoalescedHandle:
         if self.__complete:
             return
 
-        with torch.cuda.stream(self.__comm_stream):
-            # split the single tensor out into individual tensors
-            param_offset = 0
-            for param in self.__params:
-                assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
-                partitions = []
-                for rank in range(self.__world_size):
-                    param_start = rank * param.ds_tensor.ds_numel
-                    if param_start < param.ds_numel:
-                        part_to_copy = self.__partitions[rank].narrow(
-                            0,
-                            param_offset,
-                            min(param.ds_numel - param_start,
-                                param.ds_tensor.ds_numel))
-                        partitions.append(part_to_copy)
+        # split the single tensor out into individual tensors
+        param_offset = 0
+        for param in self.__params:
+            assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
+            partitions = []
+            for rank in range(self.__world_size):
+                param_start = rank * param.ds_tensor.ds_numel
+                if param_start < param.ds_numel:
+                    part_to_copy = self.__partitions[rank].narrow(
+                        0,
+                        param_offset,
+                        min(param.ds_numel - param_start,
+                            param.ds_tensor.ds_numel))
+                    partitions.append(part_to_copy)
 
-                replicated_tensor = instrument_w_nvtx(torch.cat)(partitions).view(
-                    param.ds_shape)
+            replicated_tensor = instrument_w_nvtx(torch.cat)(partitions).view(
+                param.ds_shape)
 
-                # FIXME: not sure why but there is a race condition where a rank will
-                # in rare cases get the wrong values on a parameter, but only within
-                # its own partition.
-                # IE:
-                #    rank0 gets [A0A1]
-                #    rank1 gets [A0B1]
-                # this is kind of weird because only one rank gets a wrong answer,
-                # which indicates the problem is after the allgather.
-                start = torch.distributed.get_rank() * param.ds_tensor.ds_numel
-                if start < param.ds_numel:
-                    numel = min(param.ds_tensor.ds_numel,
-                                replicated_tensor.numel() - start)
-                    src_tensor = param.ds_tensor.narrow(0, 0, numel)
-                    dst_tensor = replicated_tensor.view(-1).narrow(0, start, numel)
-                    dst_tensor.copy_(src_tensor)
+            # FIXME: not sure why but there is a race condition where a rank will
+            # in rare cases get the wrong values on a parameter, but only within
+            # its own partition.
+            # IE:
+            #    rank0 gets [A0A1]
+            #    rank1 gets [A0B1]
+            # this is kind of weird because only one rank gets a wrong answer,
+            # which indicates the problem is after the allgather.
+            start = torch.distributed.get_rank() * param.ds_tensor.ds_numel
+            if start < param.ds_numel:
+                numel = min(param.ds_tensor.ds_numel, replicated_tensor.numel() - start)
+                src_tensor = param.ds_tensor.narrow(0, 0, numel)
+                dst_tensor = replicated_tensor.view(-1).narrow(0, start, numel)
+                dst_tensor.copy_(src_tensor)
 
-                param.data = replicated_tensor.data
-                param.ds_status = ZeroParamStatus.AVAILABLE
+            param.data = replicated_tensor.data
+            param.ds_status = ZeroParamStatus.AVAILABLE
 
-                param_offset += param.ds_tensor.ds_numel
-
-        torch.cuda.current_stream().wait_stream(self.__comm_stream)
+            param_offset += param.ds_tensor.ds_numel
 
         self.__complete = True
 
@@ -571,8 +565,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 self._convert_to_deepspeed_param(param)
                 param.partition()
 
-        self.__comm_stream = Stream()
-
     def _validate_remote_device(self, remote_device, ds_config):
         if ds_config is not None:
             _ds_config = DeepSpeedConfig(ds_config)
@@ -655,67 +647,60 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         @instrument_w_nvtx
         def all_gather_coalesced(params, safe_mode=False) -> AllGatherCoalescedHandle:
-            with torch.cuda.stream(self.__comm_stream):
-                # fetches from nvme if the partition is not available and in nvme
-                self._ensure_availability_of_partitioned_params(params)
+            # fetches from nvme if the partition is not available and in nvme
+            self._ensure_availability_of_partitioned_params(params)
 
-                params_to_gather = []
-                for p in filter(lambda p: p.ds_status == ZeroParamStatus.NOT_AVAILABLE,
-                                params):
-                    p.ds_status = ZeroParamStatus.INFLIGHT
-                    params_to_gather.append(p)
-                # ensure that each rank has params in same order. the allgather
-                # is done by flattening the parameter list into a single tensor that
-                # can be allgathered in a single call - this means that if each rank
-                # gives a list of the same parameters in a different order we will
-                # silently get incorrect parameter values, and have very difficult
-                # to debug correctness issues.
-                params_to_gather.sort(key=lambda p: p.ds_id)
+            params_to_gather = []
+            for p in filter(lambda p: p.ds_status == ZeroParamStatus.NOT_AVAILABLE,
+                            params):
+                p.ds_status = ZeroParamStatus.INFLIGHT
+                params_to_gather.append(p)
+            # ensure that each rank has params in same order. the allgather
+            # is done by flattening the parameter list into a single tensor that
+            # can be allgathered in a single call - this means that if each rank
+            # gives a list of the same parameters in a different order we will
+            # silently get incorrect parameter values, and have very difficult
+            # to debug correctness issues.
+            params_to_gather.sort(key=lambda p: p.ds_id)
 
-                if safe_mode:
-                    # ensure that same list (with same ordering) of parameters are
-                    # being allgathered across all ranks, otherwise could mix
-                    # data between tensors.
-                    assert_ints_same_as_other_ranks([p.ds_id for p in params_to_gather])
-                    # ensure that tensors from each rank agree on the same ds_numel
-                    # otherwise could mix data between tensors.
-                    assert_ints_same_as_other_ranks(
-                        [p.ds_tensor.ds_numel for p in params_to_gather])
+            if safe_mode:
+                # ensure that same list (with same ordering) of parameters are
+                # being allgathered across all ranks, otherwise could mix
+                # data between tensors.
+                assert_ints_same_as_other_ranks([p.ds_id for p in params_to_gather])
+                # ensure that tensors from each rank agree on the same ds_numel
+                # otherwise could mix data between tensors.
+                assert_ints_same_as_other_ranks(
+                    [p.ds_tensor.ds_numel for p in params_to_gather])
 
-                partition_sz = sum(p.ds_tensor.ds_numel for p in params_to_gather)
+            partition_sz = sum(p.ds_tensor.ds_numel for p in params_to_gather)
 
-                data_types = set(p.dtype for p in params_to_gather)
-                if len(data_types) != 1:
-                    raise RuntimeError(
-                        f"all tensors must have same dtype, got {data_types}")
-                dtype, = data_types
-                flat_tensor = torch.empty(partition_sz * self.world_size,
-                                          dtype=dtype,
-                                          device=self.local_device,
-                                          requires_grad=False)
-                partitions: List[Parameter] = []
-                for i in range(self.world_size):
-                    partitions.append(
-                        flat_tensor.narrow(0,
-                                           partition_sz * i,
-                                           partition_sz))
+            data_types = set(p.dtype for p in params_to_gather)
+            if len(data_types) != 1:
+                raise RuntimeError(f"all tensors must have same dtype, got {data_types}")
+            dtype, = data_types
+            flat_tensor = torch.empty(partition_sz * self.world_size,
+                                      dtype=dtype,
+                                      device=self.local_device,
+                                      requires_grad=False)
+            partitions: List[Parameter] = []
+            for i in range(self.world_size):
+                partitions.append(flat_tensor.narrow(0, partition_sz * i, partition_sz))
 
-                instrument_w_nvtx(
-                    torch.cat)([p.ds_tensor.data for p in params_to_gather],
-                               out=partitions[self.rank])
+            instrument_w_nvtx(torch.cat)([p.ds_tensor.data for p in params_to_gather],
+                                         out=partitions[self.rank])
 
-                instrument_w_nvtx(torch.distributed._all_gather_base)(
-                    flat_tensor,
-                    partitions[self.rank],
-                    group=self.ds_process_group,
-                )
+            instrument_w_nvtx(torch.distributed._all_gather_base)(
+                flat_tensor,
+                partitions[self.rank],
+                group=self.ds_process_group,
+            )
 
-                return AllGatherCoalescedHandle(
-                    params=params_to_gather,
-                    partitions=partitions,
-                    world_size=self.world_size,
-                    comm_stream=self.__comm_stream,
-                )
+            return AllGatherCoalescedHandle(
+                params=params_to_gather,
+                partitions=partitions,
+                world_size=self.world_size,
+            )
 
         def partition(param_list=None, hierarchy=0, has_been_updated=False):
             cls = param

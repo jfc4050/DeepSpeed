@@ -178,6 +178,7 @@ class PartitionedParameterCoordinator:
             prefetch_bucket_sz: int,
             max_reuse_distance_in_numel: int,
             max_available_parameters_in_numel: int,
+            allgather_stream: Stream,
             prefetch_nvme: bool = False,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
@@ -203,6 +204,8 @@ class PartitionedParameterCoordinator:
         self.__prefetch_bucket_sz: int = prefetch_bucket_sz
         self.__prefetch_nvme: bool = prefetch_nvme
         self.hierarchy: int = 0
+
+        self.__allgather_stream: Stream = allgather_stream
 
         dist.barrier()
 
@@ -328,9 +331,12 @@ class PartitionedParameterCoordinator:
         for param in iter_params(current_submodule):
             param.ds_active_sub_modules.add(current_submodule.id)
             if param in self.__inflight_param_registry:
-                self.__inflight_param_registry.pop(param).wait()
+                with torch.cuda.stream(self.__allgather_stream):
+                    self.__inflight_param_registry.pop(param).wait()
             info_rank_0(f"-wait: {param.ds_summary()}")
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
+
+        torch.cuda.current_stream().wait_stream(self.__allgather_stream)
 
         self.__step_id += 1
 
@@ -372,7 +378,8 @@ class PartitionedParameterCoordinator:
                 self.__n_available_params += param.ds_numel
 
         if partitioned_params:
-            handle = partitioned_params[0].all_gather_coalesced(partitioned_params)
+            with torch.cuda.stream(self.__allgather_stream):
+                handle = partitioned_params[0].all_gather_coalesced(partitioned_params)
             for param in partitioned_params:
                 assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
                 self.__inflight_param_registry[param] = handle
@@ -615,11 +622,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.device = torch.cuda.current_device(
         ) if not self.offload_optimizer else OFFLOAD_CPU_DEVICE
+
+        ### streams used for overlapping computation with communication
+        self.__allgather_stream = Stream()
+        self.__reduce_and_partition_stream = torch.cuda.default_stream()
+
         ############################################################################
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=int(prefetch_bucket_size),
             max_reuse_distance_in_numel=int(max_reuse_distance),
             max_available_parameters_in_numel=int(max_live_parameters),
+            allgather_stream=self.__allgather_stream,
             prefetch_nvme=self.params_in_nvme_and_cpu,
         )
 
@@ -712,8 +725,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.initialize_optimizer_states()
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
-
-        self.__reduce_and_partition_stream = Stream()
 
         # IPG
         self.reduce_bucket_size = int(reduce_bucket_size)
