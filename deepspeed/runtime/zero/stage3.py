@@ -1431,11 +1431,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
+        torch.cuda.synchronize()
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         self.__reduce_and_partition_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
-
-        torch.cuda.synchronize()
 
         #in case of cpu offload, averaged gradients are already in fp32_partitioned_groups_flat.grad
         #TODO: use a similar code path for both cpu_offload and non-cpu offload
@@ -1461,6 +1460,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage(f"End ipg_epilogue", force=False)
 
         self.zero_grad()
+        torch.cuda.synchronize()
 
     def __init_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
@@ -1527,6 +1527,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
             torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
+            # FIXME: see notes below about why should this be required?
+            torch.cuda.current_stream().wait_stream(self.__allgather_stream)
             # move the parameter's gradient to the contiguous flat buffer
             new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
                 0,
