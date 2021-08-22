@@ -641,3 +641,12 @@ def info_rank_0(message: str) -> None:
     #     if dist.get_rank() == 0:
     #         print(message)
     pass
+
+
+def get_only_unique_item(items):
+    item_set = set(items)
+    if len(item_set) != 1:
+        raise RuntimeError(f"expected there to be only one unique element in {items}")
+    unique_item, = item_set
+
+    return unique_item

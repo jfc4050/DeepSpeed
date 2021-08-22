@@ -23,7 +23,7 @@ from torch.nn import Parameter
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
 
-from ..utils import info_rank_0, see_memory_usage
+from ..utils import get_only_unique_item, info_rank_0, see_memory_usage
 from deepspeed.utils import log_dist, init_distributed, instrument_w_nvtx
 from deepspeed.utils.debug import debug_param2name_id_shape, debug_param2name_id_shape_device, debug_module2name, debug_param2name, debug_param2name_id_shape_status, printflock, log_rank_file
 
@@ -667,13 +667,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 assert_ints_same_as_other_ranks([p.ds_tensor.ds_numel for p in params])
 
             partition_sz = sum(p.ds_tensor.ds_numel for p in params)
-
-            data_types = set(p.dtype for p in params)
-            if len(data_types) != 1:
-                raise RuntimeError(f"all tensors must have same dtype, got {data_types}")
-            dtype, = data_types
             flat_tensor = torch.empty(partition_sz * self.world_size,
-                                      dtype=dtype,
+                                      dtype=get_only_unique_item(p.dtype
+                                                                 for p in params),
                                       device=self.local_device,
                                       requires_grad=False)
             partitions: List[Parameter] = []
