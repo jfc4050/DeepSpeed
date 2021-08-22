@@ -234,6 +234,11 @@ class PartitionedParameterCoordinator:
 
     def reset_step(self) -> None:
         """indicate that we have completed one fwd+bwd for the model"""
+        if self.__inflight_param_registry:
+            raise RuntimeError(
+                f"still have inflight params "
+                f"{[p.ds_summary for p in self.__inflight_param_registry.keys()]}")
+
         if not self.trace_complete:
             # make sure that recorded parameter and submodule orders are
             # identical across ranks
