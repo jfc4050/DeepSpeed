@@ -7,6 +7,7 @@ from deepspeed.runtime.zero.utils import assert_ints_same_as_other_ranks
 import os
 import time
 import types
+from typing import Iterable
 from enum import Enum
 import functools
 import itertools
@@ -635,36 +636,36 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             return self._all_gather(param_list, async_op=async_op, hierarchy=hierarchy)
 
         @instrument_w_nvtx
-        def all_gather_coalesced(params, safe_mode=False) -> AllGatherCoalescedHandle:
+        def all_gather_coalesced(params: Iterable[Parameter],
+                                 safe_mode: bool = False) -> AllGatherCoalescedHandle:
             # fetches from nvme if the partition is not available and in nvme
             self._ensure_availability_of_partitioned_params(params)
 
-            params_to_gather = []
-            for p in filter(lambda p: p.ds_status == ZeroParamStatus.NOT_AVAILABLE,
-                            params):
-                p.ds_status = ZeroParamStatus.INFLIGHT
-                params_to_gather.append(p)
+            for param in params:
+                if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
+                    raise RuntimeError(param.ds_summary())
+                param.ds_status = ZeroParamStatus.INFLIGHT
+
             # ensure that each rank has params in same order. the allgather
             # is done by flattening the parameter list into a single tensor that
             # can be allgathered in a single call - this means that if each rank
             # gives a list of the same parameters in a different order we will
             # silently get incorrect parameter values, and have very difficult
             # to debug correctness issues.
-            params_to_gather.sort(key=lambda p: p.ds_id)
+            params = sorted(params, key=lambda p: p.ds_id)
 
             if safe_mode:
                 # ensure that same list (with same ordering) of parameters are
                 # being allgathered across all ranks, otherwise could mix
                 # data between tensors.
-                assert_ints_same_as_other_ranks([p.ds_id for p in params_to_gather])
+                assert_ints_same_as_other_ranks([p.ds_id for p in params])
                 # ensure that tensors from each rank agree on the same ds_numel
                 # otherwise could mix data between tensors.
-                assert_ints_same_as_other_ranks(
-                    [p.ds_tensor.ds_numel for p in params_to_gather])
+                assert_ints_same_as_other_ranks([p.ds_tensor.ds_numel for p in params])
 
-            partition_sz = sum(p.ds_tensor.ds_numel for p in params_to_gather)
+            partition_sz = sum(p.ds_tensor.ds_numel for p in params)
 
-            data_types = set(p.dtype for p in params_to_gather)
+            data_types = set(p.dtype for p in params)
             if len(data_types) != 1:
                 raise RuntimeError(f"all tensors must have same dtype, got {data_types}")
             dtype, = data_types
@@ -676,7 +677,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             for i in range(self.world_size):
                 partitions.append(flat_tensor.narrow(0, partition_sz * i, partition_sz))
 
-            instrument_w_nvtx(torch.cat)([p.ds_tensor.data for p in params_to_gather],
+            instrument_w_nvtx(torch.cat)([p.ds_tensor.data for p in params],
                                          out=partitions[self.rank])
 
             instrument_w_nvtx(torch.distributed._all_gather_base)(
@@ -686,7 +687,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             )
 
             return AllGatherCoalescedHandle(
-                params=params_to_gather,
+                params=params,
                 partitions=partitions,
                 world_size=self.world_size,
             )
