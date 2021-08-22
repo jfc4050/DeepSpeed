@@ -654,6 +654,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # to debug correctness issues.
             params = sorted(params, key=lambda p: p.ds_id)
 
+            info_rank_0(f"-allgather_coalesced: {[p.ds_id for p in params]}")
+
             if safe_mode:
                 # ensure that same list (with same ordering) of parameters are
                 # being allgathered across all ranks, otherwise could mix
