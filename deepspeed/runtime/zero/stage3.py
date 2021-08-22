@@ -180,7 +180,6 @@ class PartitionedParameterCoordinator:
             max_reuse_distance_in_numel: int,
             max_available_parameters_in_numel: int,
             allgather_stream: Stream,
-            dependent_streams: Iterable[Stream],
             prefetch_nvme: bool = False,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
@@ -209,8 +208,6 @@ class PartitionedParameterCoordinator:
 
         # stream that will be used for allgather operations
         self.__allgather_stream: Stream = allgather_stream
-        # streams where the parameters being allgathered will be consumed
-        self.__dependent_streams: Iterable[Stream] = dependent_streams
 
         dist.barrier()
 
@@ -342,8 +339,7 @@ class PartitionedParameterCoordinator:
             info_rank_0(f"-wait: {param.ds_summary()}")
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
 
-        for stream in self.__dependent_streams:
-            stream.wait_stream(self.__allgather_stream)
+        torch.cuda.current_stream().wait_stream(self.__allgather_stream)
 
         self.__step_id += 1
 
@@ -644,7 +640,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             max_reuse_distance_in_numel=int(max_reuse_distance),
             max_available_parameters_in_numel=int(max_live_parameters),
             allgather_stream=self.__allgather_stream,
-            dependent_streams=[torch.cuda.default_stream()],
             prefetch_nvme=self.params_in_nvme_and_cpu,
         )
 
