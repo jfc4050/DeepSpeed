@@ -643,10 +643,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             max_reuse_distance_in_numel=int(max_reuse_distance),
             max_available_parameters_in_numel=int(max_live_parameters),
             allgather_stream=self.__allgather_stream,
-            dependent_streams=[
-                torch.cuda.default_stream(),
-                self.__reduce_and_partition_stream
-            ],
+            dependent_streams=[torch.cuda.default_stream()],
             prefetch_nvme=self.params_in_nvme_and_cpu,
         )
 
@@ -1530,8 +1527,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
             torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
-            # FIXME: see notes below about why should this be required?
-            torch.cuda.current_stream().wait_stream(self.__allgather_stream)
             # move the parameter's gradient to the contiguous flat buffer
             new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
                 0,
@@ -1646,12 +1641,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
             torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
-            # FIXME: why is this required to make the race conditions stop?
-            # when we call wait() on a parameter it already makes this stream wait.
-            # its possible that there are parameters being used here that we haven't
-            # explicitly called wait on yet - maybe a hook execution order or tracing
-            # issue?
-            torch.cuda.current_stream().wait_stream(self.__allgather_stream)
             if safe_mode:
                 assert_ints_same_as_other_ranks(
                     [p.ds_id for p in self.__params_in_ipg_bucket])
