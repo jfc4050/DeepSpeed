@@ -358,10 +358,12 @@ class InsertPostInitMethodToModuleSubClasses(object):
 class AllGatherCoalescedHandle:
     def __init__(
             self,
+            allgather_handle,
             params: List[Parameter],
             partitions: List[Tensor],
             world_size: int,
     ) -> None:
+        self.__allgather_handle = allgather_handle
         self.__params = params
         self.__partitions = partitions
         self.__world_size = world_size
@@ -376,6 +378,8 @@ class AllGatherCoalescedHandle:
     def wait(self) -> None:
         if self.__complete:
             return
+
+        instrument_w_nvtx(self.__allgather_handle.wait)()
 
         # split the single tensor out into individual tensors
         param_offset = 0
@@ -679,13 +683,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             instrument_w_nvtx(torch.cat)([p.ds_tensor.data for p in params],
                                          out=partitions[self.rank])
 
-            instrument_w_nvtx(torch.distributed._all_gather_base)(
+            handle = instrument_w_nvtx(torch.distributed._all_gather_base)(
                 flat_tensor,
                 partitions[self.rank],
                 group=self.ds_process_group,
+                async_op=True,
             )
 
             return AllGatherCoalescedHandle(
+                allgather_handle=handle,
                 params=params,
                 partitions=partitions,
                 world_size=self.world_size,
