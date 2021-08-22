@@ -392,10 +392,7 @@ class AllGatherCoalescedHandle:
                             param.ds_tensor.ds_numel))
                     partitions.append(part_to_copy)
 
-            replicated_tensor = instrument_w_nvtx(torch.cat)(partitions).view(
-                param.ds_shape)
-
-            param.data = replicated_tensor.data
+            param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
             param.ds_status = ZeroParamStatus.AVAILABLE
 
             param_offset += param.ds_tensor.ds_numel
