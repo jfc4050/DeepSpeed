@@ -11,6 +11,7 @@ from collections import OrderedDict, UserDict
 import itertools
 from typing import Dict, Iterable, Set
 import torch
+from torch.cuda import Stream
 from torch.nn import Module, Parameter
 from torch.optim.optimizer import Optimizer
 import torch.distributed as dist
