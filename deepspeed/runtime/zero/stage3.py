@@ -260,6 +260,7 @@ class PartitionedParameterCoordinator:
     """
 
     @instrument_w_nvtx
+    @torch.no_grad()
     def fetch_sub_module(self, current_submodule: Module) -> None:
         """This method does the following (in order):
         1. kick off fetch for parameters in immediately required sub module
@@ -346,6 +347,7 @@ class PartitionedParameterCoordinator:
         self.__step_id += 1
 
     @instrument_w_nvtx
+    @torch.no_grad()
     def release_sub_module(self, submodule: Module) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
@@ -362,6 +364,7 @@ class PartitionedParameterCoordinator:
                 self.__release_param(param)
 
     @instrument_w_nvtx
+    @torch.no_grad()
     def release_and_reset_parameter(self, param: Parameter) -> None:
         """release a parameter, assuming it meets conditions to be released."""
         if param in self.__inflight_param_registry:
