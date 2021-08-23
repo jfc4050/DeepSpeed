@@ -22,6 +22,7 @@ from torch.nn.parameter import Parameter
 
 from deepspeed.utils.logging import logger
 from deepspeed.runtime.fp16.loss_scaler import LossScaler, DynamicLossScaler
+from deepspeed.runtime.comm.coalesced_collectives import reduce_scatter_coalesced
 from deepspeed.runtime.utils import info_rank_0, see_memory_usage, is_model_parallel_parameter
 from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.partition_parameters import _init_external_params
@@ -1653,20 +1654,27 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> None:
-        if not self.reduce_scatter:
+        """average gradients and scatter partitions across ranks"""
+        for param in params_to_reduce:
+            if param.grad.numel() != param.ds_numel:
+                raise RuntimeError(
+                    f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter "
+                    f"gradients whose size is not same as the params")
+
+        if self.reduce_scatter:
+            grad_partitions_for_rank = reduce_scatter_coalesced(
+                [p.grad for p in params_to_reduce],
+                self.dp_process_group)
+            for param, grad_partition in zip(params_to_reduce, grad_partitions_for_rank):
+                start = dist.get_rank(self.dp_process_group) * param.ds_tensor.ds_numel
+                param.grad.view(-1).narrow(
+                    0,
+                    start,
+                    min(param.ds_numel - start,
+                        param.ds_tensor.ds_numel)).copy_(grad_partition)
+        else:
             for param in params_to_reduce:
                 self.gradient_reduction_w_predivide(param.grad)
-            return
-
-        for param in params_to_reduce:
-            param.grad.div_(dist.get_world_size(group=self.dp_process_group))
-
-        # reduction resulting with each rank only holding the gradient partition it owns
-        # This could either be a reduce scatter or a reduce op depending on how
-        # parameters are partitionied. The method is implemented by the
-        # DeepSpeed param extensions to the pytorch parameter, so its up to
-        # the extension to define what happens here
-        params_to_reduce[0].reduce_gradients_at_owner(param_list=params_to_reduce)
 
     @instrument_w_nvtx
     def __partition_grads(self, params_to_release: List[Parameter]) -> None:
