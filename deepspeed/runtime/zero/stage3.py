@@ -1451,6 +1451,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 #     self.fp32_partitioned_groups_flat[i].numel(),
                 #     return_tensor_list=True)
 
+        self.__ipg_bucket_flat_buffer.record_stream(self.__reduce_and_partition_stream)
         self.__ipg_bucket_flat_buffer = None
         if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
             self.__param_id_to_grad_partition.clear()
@@ -2207,6 +2208,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.optimizer_swapper.pre_backward()
 
         see_memory_usage(f"Before backward", force=False)
+        assert self.__ipg_bucket_flat_buffer is None
         self.__ipg_bucket_flat_buffer = torch.empty(self.reduce_bucket_size,
                                                     dtype=self.__param_dtype,
                                                     device=torch.cuda.current_device(),
