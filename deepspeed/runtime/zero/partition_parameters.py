@@ -23,9 +23,10 @@ from torch.nn import Parameter
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
 
-from ..utils import get_only_unique_item, info_rank_0, see_memory_usage
+from ..utils import get_only_unique_item, see_memory_usage
 from deepspeed.utils import log_dist, init_distributed, instrument_w_nvtx
 from deepspeed.utils.debug import debug_param2name_id_shape, debug_param2name_id_shape_device, debug_module2name, debug_param2name, debug_param2name_id_shape_status, printflock, log_rank_file
+from deepspeed.utils.logging import logger
 
 from ..swap_tensor.partitioned_param_swapper import AsyncPartitionedParameterSwapper, PartitionedParamStatus
 from ..config import DeepSpeedConfig
@@ -43,6 +44,11 @@ def print_rank_0(message, debug=False, force=False):
     # printflock(f"[{rank}] {message}")
     # - print to log file per rank
     # log_rank_file(rank, message)
+
+
+def debug_rank0(msg: str) -> None:
+    if torch.distributed.get_rank() == 0:
+        logger.debug(msg)
 
 
 def is_zero_param(parameter):
@@ -655,7 +661,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # to debug correctness issues.
             params = sorted(params, key=lambda p: p.ds_id)
 
-            info_rank_0(f"-allgather_coalesced: {[p.ds_id for p in params]}")
+            debug_rank0(f"-allgather_coalesced: {[p.ds_id for p in params]}")
 
             if safe_mode:
                 # ensure that same list (with same ordering) of parameters are

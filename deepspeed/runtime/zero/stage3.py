@@ -23,7 +23,7 @@ from torch.nn.parameter import Parameter
 from deepspeed.utils.logging import logger
 from deepspeed.runtime.fp16.loss_scaler import LossScaler, DynamicLossScaler
 from deepspeed.runtime.comm.coalesced_collectives import reduce_scatter_coalesced
-from deepspeed.runtime.utils import info_rank_0, see_memory_usage, is_model_parallel_parameter
+from deepspeed.runtime.utils import see_memory_usage, is_model_parallel_parameter
 from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.partition_parameters import _init_external_params
 from deepspeed.runtime.zero.constants import ZERO_OPTIMIZATION_WEIGHTS
@@ -44,6 +44,11 @@ FWD_MODULE_STACK = list()
 def print_rank_0(message, debug=False, force=False):
     if torch.distributed.get_rank() == 0 and (debug or force):
         logger.info(message)
+
+
+def debug_rank0(message: str) -> None:
+    if dist.get_rank() == 0:
+        logger.debug(message)
 
 
 def get_cuda_mem_allocated_str() -> str:
@@ -271,7 +276,7 @@ class PartitionedParameterCoordinator:
         2. kick off fetch for next few parameters we will need later (prefetch)
         3. block on parameters in immediately required sub module
         """
-        info_rank_0(
+        debug_rank0(
             f"{self.__step_id}: M{current_submodule.id}({type(current_submodule).__name__}) P{[p.ds_id for p in iter_params(current_submodule)]} "
             + str({
                 "avail": f"{self.__n_available_params:.1e}",
@@ -306,12 +311,9 @@ class PartitionedParameterCoordinator:
                         f"parameter fetch queue to be {tuple(p.ds_summary() for p in params_not_already_fetched)} "
                         f"but got {tuple(p.ds_summary() for p in discarded_from_prefetch_queue)}."
                     )
-                info_rank_0(
-                    f"-discarded from prefetch queue: {set(p.ds_id for p in discarded_from_prefetch_queue)}"
-                )
             # kick off all gather for params in the immediately required submodule
             for param in params_to_fetch:
-                info_rank_0(f"-fetch: {param.ds_summary()}")
+                debug_rank0(f"-fetch: {param.ds_summary()}")
             with torch.cuda.nvtx.range("fetch"):
                 self.__all_gather_params(params_to_fetch)
 
@@ -330,7 +332,7 @@ class PartitionedParameterCoordinator:
                     params_to_prefetch.add(param_in_trace.param)
                     numel_prefetching += param_in_trace.param.ds_numel
             for param in params_to_prefetch:
-                info_rank_0(f"-prefetch: {param.ds_summary()}")
+                debug_rank0(f"-prefetch: {param.ds_summary()}")
             self.__all_gather_params(params_to_prefetch)
 
         if self.__prefetch_nvme:
@@ -339,10 +341,10 @@ class PartitionedParameterCoordinator:
         # wait for parameters in the immediately needed submodule to become available
         for param in iter_params(current_submodule):
             param.ds_active_sub_modules.add(current_submodule.id)
+            debug_rank0(f"-wait: {param.ds_summary()}")
             if param in self.__inflight_param_registry:
                 with torch.cuda.stream(self.__allgather_stream):
                     self.__inflight_param_registry.pop(param).wait()
-            info_rank_0(f"-wait: {param.ds_summary()}")
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
 
         torch.cuda.current_stream().wait_stream(self.__allgather_stream)
@@ -397,11 +399,8 @@ class PartitionedParameterCoordinator:
 
     @instrument_w_nvtx
     def __release_param(self, param: Parameter) -> None:
-        mem_before = get_cuda_mem_allocated_str()
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
-            info_rank_0(
-                f"-release: {param.ds_summary()}, {mem_before} -> {get_cuda_mem_allocated_str()}"
-            )
+            debug_rank0(f"-release: {param.ds_summary()}")
             param.partition()
             self.__n_available_params -= param.ds_numel
 
@@ -450,8 +449,6 @@ class PartitionedParameterCoordinator:
 
         if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
-
-        info_rank_0(f"-swapping in {swap_in_params}")
 
 
 class PreBackwardFunction(torch.autograd.Function):

@@ -634,15 +634,6 @@ def call_to_str(base, *args, **kwargs):
     return name
 
 
-def info_rank_0(message: str) -> None:
-    # if False:
-    #     logger.info(f"RANK{dist.get_rank()} {message}")
-    # else:
-    #     if dist.get_rank() == 0:
-    #         print(message)
-    pass
-
-
 def get_only_unique_item(items):
     item_set = set(items)
     if len(item_set) != 1:
