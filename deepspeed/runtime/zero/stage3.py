@@ -736,13 +736,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
 
-        # IPG
-        self.reduce_bucket_size = int(reduce_bucket_size)
-        self.__ipg_bucket_flat_buffer: Tensor = None
-        self.__params_in_ipg_bucket: List[Parameter] = []
-        self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
-        self.is_gradient_accumulation_boundary: bool = True
-
         # Unique ID for each parameter
         self.param_id = {}
         count = 0
@@ -750,6 +743,36 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             for param in params_group:
                 self.param_id[id(param)] = count
                 count += 1
+
+        # IPG
+        self.__ipg_bucket_flat_buffer: Tensor = torch.empty(int(reduce_bucket_size),
+                                                            dtype=self.__param_dtype,
+                                                            device=self.device)
+
+        self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
+        if not (self.offload_optimizer and self.gradient_accumulation_steps > 1):
+            all_params = list(itertools.chain.from_iterable(self.__fp16_param_groups))
+
+            grad_partitions_flat_buffer: Tensor = torch.zeros(
+                sum(p.ds_tensor.ds_numel for p in all_params),
+                dtype=self.__param_dtype,
+                device=self.device,
+                pin_memory=self.offload_param_pin_memory)
+
+            offset = 0
+            for param in all_params:
+                param_id = self.get_param_id(param)
+                self.__param_id_to_grad_partition[
+                    param_id] = grad_partitions_flat_buffer.narrow(
+                        0,
+                        offset,
+                        param.ds_tensor.ds_numel)
+                offset += param.ds_tensor.ds_numel
+
+        torch.cuda.synchronize()
+
+        self.__params_in_ipg_bucket: List[Parameter] = []
+        self.is_gradient_accumulation_boundary: bool = True
 
         # map each parameter to its group index and its offset within that group's
         # flattened buffer
@@ -1453,14 +1476,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 #     return_tensor_list=True)
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
-            self.__ipg_bucket_flat_buffer.record_stream(torch.cuda.current_stream())
-            self.__ipg_bucket_flat_buffer = None
-
-            if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
-                for partition in self.__param_id_to_grad_partition.values():
-                    partition.record_stream(torch.cuda.current_stream())
-                self.__param_id_to_grad_partition.clear()
-
             self.zero_grad()
 
         torch.cuda.synchronize()
@@ -1505,7 +1520,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def report_ipg_memory_usage(self, tag, param_elems):
         elem_count = self.__elements_in_ipg_bucket + param_elems
-        percent_of_bucket_size = (100.0 * elem_count) // self.reduce_bucket_size
+        percent_of_bucket_size = (100.0 *
+                                  elem_count) // self.__ipg_bucket_flat_buffer.numel()
         see_memory_usage(
             f"{tag}: elems in_bucket {self.__elements_in_ipg_bucket} param {param_elems} max_percent {percent_of_bucket_size}",
             force=False)
@@ -1671,32 +1687,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def __partition_grads(self, params_to_release: List[Parameter]) -> None:
         if not params_to_release:
             return
-
-        if not self.__param_id_to_grad_partition and (
-                not self.offload_optimizer or self.gradient_accumulation_steps > 1):
-            for i, group in enumerate(self.__fp16_param_groups):
-                numel_of_grad_partitions_in_param_group = sum(p.ds_tensor.ds_numel
-                                                              for p in group)
-                see_memory_usage(
-                    f"group {i} before creating {numel_of_grad_partitions_in_param_group} reduced gradients into partition"
-                )
-                grad_partitions_in_param_group_flat_buffer: Tensor = torch.zeros(
-                    numel_of_grad_partitions_in_param_group,
-                    dtype=self.__param_dtype,
-                    device=self.device,
-                    pin_memory=self.offload_param_pin_memory)
-                see_memory_usage(
-                    f"group {i} after creating {numel_of_grad_partitions_in_param_group} reduced gradients into partition"
-                )
-                offset = 0
-                for param in group:
-                    param_id = self.get_param_id(param)
-                    self.__param_id_to_grad_partition[
-                        param_id] = grad_partitions_in_param_group_flat_buffer.narrow(
-                            0,
-                            offset,
-                            param.ds_tensor.ds_numel)
-                    offset += param.ds_tensor.ds_numel
 
         if self.offload_optimizer:
             offload_fp32_gradients = {}
@@ -2202,11 +2192,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.optimizer_swapper.pre_backward()
 
         see_memory_usage(f"Before backward", force=False)
-        assert self.__ipg_bucket_flat_buffer is None
-        self.__ipg_bucket_flat_buffer = torch.empty(self.reduce_bucket_size,
-                                                    dtype=self.__param_dtype,
-                                                    device=torch.cuda.current_device(),
-                                                    requires_grad=False)
+
+        # TODO. fix for grad accumulation
+        for grad in self.__param_id_to_grad_partition.values():
+            grad.zero_()
 
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
