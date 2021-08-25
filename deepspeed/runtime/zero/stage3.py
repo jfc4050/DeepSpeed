@@ -1452,14 +1452,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 #     self.fp32_partitioned_groups_flat[i].numel(),
                 #     return_tensor_list=True)
 
-        self.__ipg_bucket_flat_buffer.record_stream(self.__reduce_and_partition_stream)
-        self.__ipg_bucket_flat_buffer = None
-        if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
-            self.__param_id_to_grad_partition.clear()
+        with torch.cuda.stream(self.__reduce_and_partition_stream):
+            self.__ipg_bucket_flat_buffer.record_stream(torch.cuda.current_stream())
+            self.__ipg_bucket_flat_buffer = None
 
-        see_memory_usage(f"End ipg_epilogue", force=False)
+            if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
+                for partition in self.__param_id_to_grad_partition.values():
+                    partition.record_stream(torch.cuda.current_stream())
+                self.__param_id_to_grad_partition.clear()
 
-        self.zero_grad()
+            self.zero_grad()
+
         torch.cuda.synchronize()
 
     def __init_reduce_and_remove_grad_hooks(self):
