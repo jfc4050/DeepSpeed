@@ -1483,7 +1483,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            self.reduce_independent_p_g_buckets_and_remove_grads(param)
+                            if self.__params_in_ipg_bucket and self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
+                            ):
+                                self.__reduce_and_partition_ipg_grads()
+
+                            self.__add_grad_to_ipg_bucket(param)
 
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
@@ -1508,25 +1512,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     ###############Idependent Partition Gradient ########################
     @instrument_w_nvtx
-    def reduce_independent_p_g_buckets_and_remove_grads(self, param: Parameter) -> None:
+    def __add_grad_to_ipg_bucket(self, param: Parameter) -> None:
         if param.ds_numel > self.__ipg_bucket_flat_buffer.numel():
-            # TODO. in future just dynamically allocate this
-            raise RuntimeError(
-                f"param ds_numel {param.ds_numel} too large for buffer of size {self.__ipg_bucket_flat_buffer.numel()}. please increase size of reduce bucket"
-            )
-
-        # Because the ipg bucket is initialized with a random place holder tensor, we must
-        # explicitly check that the bucket has any real data in it (self.elements_in_ipg_bucket >
-        # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
-        # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
-        # empty, while reduction_list will have that garbage data.
-        if self.__params_in_ipg_bucket and self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
-        ):
-            self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
-                                         param.ds_numel)
-            self.__reduce_and_partition_ipg_grads()
-            self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads",
-                                         param.ds_numel)
+            raise NotImplementedError(
+                f"param ds_numel {param.ds_numel} too large for fixed buffer of size {self.__ipg_bucket_flat_buffer.numel()}. "
+                f"in the future it is possible to just dynamically allocate and reduce but for now "
+                f"please increase size of reduce bucket")
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
             torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
@@ -1534,12 +1525,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
                 0,
                 self.__elements_in_ipg_bucket,
-                param.ds_numel)
-            new_grad_tensor.copy_(param.grad.view(-1))
-            param.grad.data = new_grad_tensor.data.view_as(param.grad)
+                param.ds_numel).view_as(param.grad)
+            new_grad_tensor.copy_(param.grad)
+            param.grad.data = new_grad_tensor
 
             self.__params_in_ipg_bucket.append(param)
-        self.report_ipg_memory_usage("End ipg_remove_grads", 0)
 
     def gradient_reduction_w_predivide(self, tensor):
         dp_world_size = dist.get_world_size(group=self.dp_process_group)
