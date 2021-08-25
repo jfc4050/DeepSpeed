@@ -1643,6 +1643,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if not self.__params_in_ipg_bucket:
             return
 
+        for param in self.__params_in_ipg_bucket:
+            if param.grad.numel() != param.ds_numel:
+                raise RuntimeError(
+                    f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter "
+                    f"gradients whose size is not same as the params")
+
         self.__params_in_ipg_bucket.sort(key=lambda p: p.ds_id)
 
         assert len(set(p.ds_id for p in self.__params_in_ipg_bucket)) == len(
@@ -1662,12 +1668,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> None:
         """average gradients and scatter partitions across ranks"""
-        for param in params_to_reduce:
-            if param.grad.numel() != param.ds_numel:
-                raise RuntimeError(
-                    f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter "
-                    f"gradients whose size is not same as the params")
-
         if self.reduce_scatter:
             grad_partitions_for_rank = reduce_scatter_coalesced(
                 [p.grad for p in params_to_reduce],
@@ -1685,9 +1685,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def __partition_grads(self, params_to_release: List[Parameter]) -> None:
-        if not params_to_release:
-            return
-
         if self.offload_optimizer:
             offload_fp32_gradients = {}
             offload_fp32_offsets = {}
