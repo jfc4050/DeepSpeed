@@ -1665,6 +1665,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.__params_in_ipg_bucket.clear()
 
+        # FIXME: get rid of this safely
+        self.__reduce_and_partition_stream.synchronize()
+
     @instrument_w_nvtx
     def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> None:
         """average gradients and scatter partitions across ranks"""
