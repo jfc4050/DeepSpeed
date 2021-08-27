@@ -1676,12 +1676,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 [p.grad for p in params_to_reduce],
                 self.dp_process_group)
             for param, grad_partition in zip(params_to_reduce, grad_partitions_for_rank):
-                start = dist.get_rank(self.dp_process_group) * param.ds_tensor.ds_numel
-                param.grad.view(-1).narrow(
-                    0,
-                    start,
-                    min(param.ds_numel - start,
-                        param.ds_tensor.ds_numel)).copy_(grad_partition)
+                param.grad.record_stream(torch.cuda.current_stream())
+                param.grad.data = grad_partition
         else:
             for param in params_to_reduce:
                 self.gradient_reduction_w_predivide(param.grad)
@@ -1732,11 +1728,24 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         gradient_offsets=offload_fp32_offsets[i],
                         gradient_tensors=offload_fp32_gradients[i])
         else:
+            should_accumulate = self.micro_step_id > 0
             for param in params_to_release:
-                param.partition_gradients(
-                    partition_buffers=self.__param_id_to_grad_partition[
-                        self.get_param_id(param)],
-                    accumulate=self.micro_step_id > 0)
+                if param.ds_tensor.ds_numel * dist.get_rank(
+                        self.dp_process_group) > param.ds_numel:
+                    # this grad partition is empty - don't need to do anything
+                    continue
+
+                grad_buffer = self.__param_id_to_grad_partition[self.get_param_id(param)]
+                grad_dst = grad_buffer.narrow(0, 0, param.grad.numel())
+                if not should_accumulate:
+                    grad_dst.copy_(param.grad)
+                else:
+                    # TODO. handle case where devices are different
+                    grad_dst.add_(param.grad)
+
+                param.grad.record_stream(torch.cuda.current_stream())
+
+                param.grad.data = grad_buffer
 
     #############################################################################
     #############################################################################
