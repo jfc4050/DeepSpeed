@@ -745,31 +745,30 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 count += 1
 
         # IPG
-        self.__ipg_bucket_flat_buffer: Tensor = torch.empty(int(reduce_bucket_size),
-                                                            dtype=self.__param_dtype,
-                                                            device=self.device)
+        self.__ipg_bucket_flat_buffer: Tensor = torch.empty(
+            int(reduce_bucket_size),
+            dtype=self.__param_dtype,
+            device=torch.cuda.current_device())
 
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
-        if not (self.offload_optimizer and self.gradient_accumulation_steps > 1):
-            all_params = list(itertools.chain.from_iterable(self.__fp16_param_groups))
 
-            grad_partitions_flat_buffer: Tensor = torch.zeros(
-                sum(p.ds_tensor.ds_numel for p in all_params),
-                dtype=self.__param_dtype,
-                device=self.device,
-                pin_memory=self.offload_param_pin_memory)
+        all_params = list(itertools.chain.from_iterable(self.__fp16_param_groups))
 
-            offset = 0
-            for param in all_params:
-                param_id = self.get_param_id(param)
-                self.__param_id_to_grad_partition[
-                    param_id] = grad_partitions_flat_buffer.narrow(
-                        0,
-                        offset,
-                        param.ds_tensor.ds_numel)
-                offset += param.ds_tensor.ds_numel
+        grad_partitions_flat_buffer: Tensor = torch.zeros(
+            sum(p.ds_tensor.ds_numel for p in all_params),
+            dtype=self.__param_dtype,
+            device=self.device,
+            pin_memory=self.offload_param_pin_memory)
 
-        torch.cuda.synchronize()
+        offset = 0
+        for param in all_params:
+            param_id = self.get_param_id(param)
+            self.__param_id_to_grad_partition[
+                param_id] = grad_partitions_flat_buffer.narrow(
+                    0,
+                    offset,
+                    param.ds_tensor.ds_numel)
+            offset += param.ds_tensor.ds_numel
 
         self.__params_in_ipg_bucket: List[Parameter] = []
         self.is_gradient_accumulation_boundary: bool = True
@@ -790,16 +789,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.accumulated_grads_in_cpu = {}
             self.norm_for_param_grads = {}
             self.local_overflow = False
-            largest_partitions_subgroup_numel = max(
-                param.ds_tensor.ds_numel for param_subgroup in self.__fp16_param_groups
-                for param in param_subgroup)
-            self.temp_grad_buffer_for_gpu_offload = torch.zeros(
-                largest_partitions_subgroup_numel,
-                device=torch.cuda.current_device(),
-                dtype=self.__param_dtype)
-            self.temp_grad_gpu_buffer = torch.zeros(largest_partitions_subgroup_numel,
-                                                    device=torch.cuda.current_device(),
-                                                    dtype=self.__param_dtype)
+
         see_memory_usage(f"After CPU Offload initialization", force=False)
 
         # will store the averaged gradients required by this parititon
@@ -1409,12 +1399,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self._optimizer_states_and_gradient_swap_in(i, timer_names)
 
             if self.offload_optimizer and not swappable_optimizer_subgroup:
-                subgroup_gradient_buffer = torch.zeros(num_elements,
-                                                       dtype=gradient_dtype,
-                                                       device=self.device)
-                if self.offload_optimizer_pin_memory:
-                    subgroup_gradient_buffer = subgroup_gradient_buffer.pin_memory()
-
+                subgroup_gradient_buffer = torch.zeros(
+                    num_elements,
+                    dtype=gradient_dtype,
+                    device=self.device,
+                    pin_memory=self.offload_optimizer_pin_memory)
                 self.fp32_partitioned_groups_flat[i].grad = subgroup_gradient_buffer
             else:
                 self.fp32_partitioned_groups_flat[i].grad = gradient_buffer.narrow(
@@ -1464,19 +1453,21 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             # in case of cpu offload, averaged gradients are already in
             # fp32_partitioned_groups_flat.grad
             # TODO. use a similar code path for both cpu_offload and non-cpu offload
-            if not self.offload_optimizer:
-                for i, sub_group in enumerate(self.__fp16_param_groups):
-                    self.averaged_gradients[i] = []
-                    for param in sub_group:
-                        if param.requires_grad:
-                            self.averaged_gradients[i].append(
-                                param.grad.narrow(0,
-                                                  0,
-                                                  param.ds_tensor.numel()))
-                            param.grad.record_stream(torch.cuda.current_stream())
-                        else:
-                            self.averaged_gradients[i].append(
-                                torch.zeros_like(param.ds_tensor))
+
+            for i, sub_group in enumerate(self.__fp16_param_groups):
+                self.averaged_gradients[i] = []
+                for param in sub_group:
+                    if param.requires_grad:
+                        param_id = self.get_param_id(param)
+
+                        self.averaged_gradients[i].append(
+                            self.__param_id_to_grad_partition[param_id].narrow(
+                                0,
+                                0,
+                                param.ds_tensor.numel()))
+                    else:
+                        self.averaged_gradients[i].append(
+                            torch.zeros_like(param.ds_tensor))
 
             torch.cuda.synchronize()
 
@@ -1578,23 +1569,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return tensor
 
-    def async_accumulate_grad_in_cpu_via_gpu(self, param, acc_grad_cpu_partition):
-
-        # copy to a preexisiting buffer to avoid memory allocation penalty
-        dest_buffer = self.temp_grad_buffer_for_gpu_offload.view(-1).narrow(
-            0,
-            0,
-            param.ds_tensor.ds_numel)
-
-        if self.micro_step_id > 0:
-            dest_buffer.copy_(acc_grad_cpu_partition.view(-1), non_blocking=True)
-            param.grad.data.view(-1).add_(dest_buffer)
-
-        # at the boundary we will send 32bit directly
-        if not self.is_gradient_accumulation_boundary:
-            acc_grad_cpu_partition.data.copy_(param.grad.data.view(-1),
-                                              non_blocking=True)
-
     def _constant_buffered_norm2(self, input, buffer_size=250000000):
         norm = None
         for part in input.view(-1).split(buffer_size):
@@ -1692,24 +1666,41 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def __partition_grads(self, params_to_release: List[Parameter]) -> None:
+        for param in params_to_release:
+            if param.ds_tensor.ds_numel * dist.get_rank(
+                    self.dp_process_group) > param.ds_numel:
+                # this grad partition is empty - don't need to do anything
+                continue
+
+            grad_buffer = self.__param_id_to_grad_partition[self.get_param_id(param)]
+            grad_dst = grad_buffer.narrow(0, 0, param.grad.numel())
+            if self.micro_step_id == 0:  # don't accumulate
+                grad_dst.copy_(param.grad, non_blocking=True)
+            elif grad_dst.is_cuda:
+                grad_dst.add_(param.grad)
+            else:
+                # if dst is CPU, copy first to src device, do the addition
+                # there, then move back to dst. adding directly to cpu is very slow
+                tmp_grad_dst = torch.empty_like(param.grad)
+                tmp_grad_dst.copy_(grad_dst, non_blocking=True)
+                tmp_grad_dst.add_(param.grad)
+                grad_dst.copy_(tmp_grad_dst, non_blocking=True)
+
+            param.grad.record_stream(torch.cuda.current_stream())
+
+            param.grad.data = grad_buffer
+
         if self.offload_optimizer:
             offload_fp32_gradients = {}
             offload_fp32_offsets = {}
 
             for param in params_to_release:
-                param_id = self.get_param_id[param]
+                param_id = self.get_param_id(param)
                 i, dest_offset = self.__param_id_to_param_group_and_offset_within_group_buffer[param_id]
                 num_elements = param.ds_tensor.ds_numel
-                param.partition_gradients(partition_buffers=self.temp_grad_gpu_buffer)
-                if self.gradient_accumulation_steps > 1:
-                    # The allreduce buffer will be rewritted. Copy the gradients in partition to a new buffer
-                    fp16_grad_tensor = self.__param_id_to_grad_partition[param_id]
-                    self.async_accumulate_grad_in_cpu_via_gpu(param, fp16_grad_tensor)
 
                 if self.is_gradient_accumulation_boundary:
-
                     self.set_norm_for_param_grad_in_gpu(param)
-
                     self.update_overflow_tracker_for_param_grad(param)
 
                     if self._swappable_optimizer_subgroup(i):
@@ -1735,33 +1726,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         parameter=self.fp32_partitioned_groups_flat[i],
                         gradient_offsets=offload_fp32_offsets[i],
                         gradient_tensors=offload_fp32_gradients[i])
-        else:
-            should_accumulate = self.micro_step_id > 0
-            for param in params_to_release:
-                if param.ds_tensor.ds_numel * dist.get_rank(
-                        self.dp_process_group) > param.ds_numel:
-                    # this grad partition is empty - don't need to do anything
-                    continue
-
-                grad_buffer = self.__param_id_to_grad_partition[self.get_param_id(param)]
-                grad_dst = grad_buffer.narrow(0, 0, param.grad.numel())
-                if not should_accumulate:
-                    grad_dst.copy_(param.grad)
-                elif param.grad.device == grad_dst.device:
-                    grad_dst.add_(param.grad)
-                else:
-                    # if source and destination are on different device, copy first
-                    # to src device then add and move back to the destination.
-                    # This seems to run faster when src is gpu and dest is cpu.
-                    # adding directly to cpu is very slow
-                    tmp_grad_dst = torch.empty_like(param.grad)
-                    tmp_grad_dst.copy_(grad_dst)
-                    tmp_grad_dst.add_(param.grad)
-                    grad_dst.copy_(tmp_grad_dst)
-
-                param.grad.record_stream(torch.cuda.current_stream())
-
-                param.grad.data = grad_buffer
 
     #############################################################################
     #############################################################################

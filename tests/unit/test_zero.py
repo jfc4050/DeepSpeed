@@ -347,10 +347,12 @@ class EltwiseMultiplicationTestNetwork(Module):
 
 @pytest.mark.parametrize("param_persistence_threshold", [0, 10])
 @pytest.mark.parametrize("fp16_enabled", [True, False])
+@pytest.mark.parametrize("offload_optimizer", [True, False])
 @pytest.mark.parametrize("iteration", list(range(1)))
 def test_zero3_param_partitioning_base(
         param_persistence_threshold: int,
         fp16_enabled: bool,
+        offload_optimizer: bool,
         iteration: int,
 ) -> None:
     @distributed_test(world_size=[2])
@@ -360,26 +362,32 @@ def test_zero3_param_partitioning_base(
         weights = [Parameter(torch.zeros((m, n), dtype=torch.float32)) for _ in range(3)]
         model = EltwiseMultiplicationTestNetwork(*weights)
 
-        ds_engine = _ds_initialize_for_param_partitioning_testing(
-            model,
-            {
-                "train_micro_batch_size_per_gpu": 1,
-                "zero_optimization": {
-                    "stage": 3,
-                    "stage3_max_reuse_distance": 0,
-                    "stage3_param_persistence_threshold": param_persistence_threshold,
-                },
-                "optimizer": {
-                    "type": "Adam",
-                    "params": {
-                        "lr": 1.
-                    }
-                },
-                "fp16": {
-                    "enabled": fp16_enabled,
-                    "loss_scale": 1.,
+        cfg = {
+            "train_micro_batch_size_per_gpu": 1,
+            "zero_optimization": {
+                "stage": 3,
+                "stage3_max_reuse_distance": 0,
+                "stage3_param_persistence_threshold": param_persistence_threshold,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1.
                 }
-            })
+            },
+            "fp16": {
+                "enabled": fp16_enabled,
+                "loss_scale": 1.,
+            }
+        }
+
+        if offload_optimizer:
+            cfg["zero_optimization"]["offload_optimizer"] = {
+                "device": "cpu",
+                "pin_memory": True,
+            }
+
+        ds_engine = _ds_initialize_for_param_partitioning_testing(model, cfg)
         for i, weight in enumerate(weights):
             weight.ds_tensor.data = torch.full_like(weight.ds_tensor.data,
                                                     (i + 1) * (1 + dist.get_rank()))
@@ -479,7 +487,7 @@ def test_zero3_param_partitioning_base(
             _assert_partition_status(ds_engine, {ZeroParamStatus.NOT_AVAILABLE})
 
             avgd_gradients = ds_engine.optimizer.averaged_gradients
-            assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
+            assert set(avgd_gradients.keys()) == {0}, f"should have one parameter group but got {len(avgd_gradients)}"
             weight_gradients: List[Tensor] = avgd_gradients[0]
 
             dloss_wrt_layer1, dloss_wrt_layer2, dloss_wrt_layer3 = weight_gradients
@@ -490,16 +498,19 @@ def test_zero3_param_partitioning_base(
             # dloss_wrt_layer2 = layer3 * hidden1
             # dloss_wrt_layer1 = layer3 * layer2 * x
             if dist.get_rank() == 0:
-                assert torch.allclose(dloss_wrt_layer3, create_tensor([2] * 8))
-                assert torch.allclose(dloss_wrt_layer2, create_tensor([3 * 1] * 8))
-                assert torch.allclose(dloss_wrt_layer1, create_tensor([3 * 2 * 1] * 8))
+                assert torch.allclose(dloss_wrt_layer3.cuda(), create_tensor([2] * 8))
+                assert torch.allclose(dloss_wrt_layer2.cuda(),
+                                      create_tensor([3 * 1] * 8))
+                assert torch.allclose(dloss_wrt_layer1.cuda(),
+                                      create_tensor([3 * 2 * 1] * 8))
             elif dist.get_rank() == 1:
                 # parameters dont split evenly across ranks so rank 1 has a zero-padded
                 # partition
-                assert torch.allclose(dloss_wrt_layer3, create_tensor(([8] * 7) + [0]))
-                assert torch.allclose(dloss_wrt_layer2,
+                assert torch.allclose(dloss_wrt_layer3.cuda(),
+                                      create_tensor(([8] * 7) + [0]))
+                assert torch.allclose(dloss_wrt_layer2.cuda(),
                                       create_tensor(([6 * 2] * 7) + [0]))
-                assert torch.allclose(dloss_wrt_layer1,
+                assert torch.allclose(dloss_wrt_layer1.cuda(),
                                       create_tensor(([6 * 4 * 1] * 7) + [0]))
             else:
                 raise RuntimeError("test has world size of two")
