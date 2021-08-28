@@ -1747,9 +1747,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 grad_dst = grad_buffer.narrow(0, 0, param.grad.numel())
                 if not should_accumulate:
                     grad_dst.copy_(param.grad)
-                else:
-                    # TODO. handle case where devices are different
+                elif param.grad.device == grad_dst.device:
                     grad_dst.add_(param.grad)
+                else:
+                    # if source and destination are on different device, copy first
+                    # to src device then add and move back to the destination.
+                    # This seems to run faster when src is gpu and dest is cpu.
+                    # adding directly to cpu is very slow
+                    tmp_grad_dst = torch.empty_like(param.grad)
+                    tmp_grad_dst.copy_(grad_dst)
+                    tmp_grad_dst.add_(param.grad)
+                    grad_dst.copy_(tmp_grad_dst)
 
                 param.grad.record_stream(torch.cuda.current_stream())
 
