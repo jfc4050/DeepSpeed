@@ -1528,6 +1528,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     ###############Idependent Partition Gradient ########################
     @instrument_w_nvtx
+    @torch.no_grad()
     def __add_grad_to_ipg_bucket(self, param: Parameter) -> None:
         if param.ds_numel > self.__ipg_bucket_flat_buffer.numel():
             raise NotImplementedError(
@@ -1640,6 +1641,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return total_norm
 
     @instrument_w_nvtx
+    @torch.no_grad()
     def __reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
         if not self.__params_in_ipg_bucket:
             return
