@@ -1655,7 +1655,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.__params_in_ipg_bucket)
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
-            torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
             if safe_mode:
                 assert_ints_same_as_other_ranks(
                     [p.ds_id for p in self.__params_in_ipg_bucket])
