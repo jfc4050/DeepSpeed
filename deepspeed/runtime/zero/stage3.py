@@ -1458,24 +1458,28 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.__reduce_and_partition_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
-        #in case of cpu offload, averaged gradients are already in fp32_partitioned_groups_flat.grad
-        #TODO: use a similar code path for both cpu_offload and non-cpu offload
-        if not self.offload_optimizer:
-            for i, sub_group in enumerate(self.__fp16_param_groups):
-                self.averaged_gradients[i] = [
-                    torch.zeros_like(param.ds_tensor) if not param.requires_grad else
-                    param.grad.data.narrow(0,
-                                           0,
-                                           param.ds_tensor.numel())
-                    for param in sub_group
-                ]
-                # self.averaged_gradients[i] = self.get_flat_partition(
-                #     self.fp16_groups[i],
-                #     0,
-                #     self.fp32_partitioned_groups_flat[i].numel(),
-                #     return_tensor_list=True)
+        torch.cuda.synchronize()
 
         with torch.cuda.stream(self.__reduce_and_partition_stream):
+            # in case of cpu offload, averaged gradients are already in
+            # fp32_partitioned_groups_flat.grad
+            # TODO. use a similar code path for both cpu_offload and non-cpu offload
+            if not self.offload_optimizer:
+                for i, sub_group in enumerate(self.__fp16_param_groups):
+                    self.averaged_gradients[i] = []
+                    for param in sub_group:
+                        if param.requires_grad:
+                            self.averaged_gradients[i].append(
+                                param.grad.narrow(0,
+                                                  0,
+                                                  param.ds_tensor.numel()))
+                            param.grad.record_stream(torch.cuda.current_stream())
+                        else:
+                            self.averaged_gradients[i].append(
+                                torch.zeros_like(param.ds_tensor))
+
+            torch.cuda.synchronize()
+
             self.zero_grad()
 
         torch.cuda.synchronize()
