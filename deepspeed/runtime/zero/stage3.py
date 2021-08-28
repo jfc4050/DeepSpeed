@@ -9,7 +9,7 @@ import os
 import collections
 from collections import OrderedDict, UserDict
 import itertools
-from typing import Dict, Iterable, Set
+from typing import Dict, Iterable, Set, Union
 import torch
 from torch.cuda import Stream
 from torch.nn import Module, Parameter
@@ -803,7 +803,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage(f"After CPU Offload initialization", force=False)
 
         # will store the averaged gradients required by this parititon
-        self.averaged_gradients = {}
+        self.averaged_gradients: Dict[int, List[Tensor]] = {}
 
         #creates backward hooks for gradient partitioning
         self.__init_reduce_and_remove_grad_hooks()
@@ -1543,6 +1543,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self.__elements_in_ipg_bucket,
                 param.ds_numel).view_as(param.grad)
             new_grad_tensor.copy_(param.grad)
+            param.grad.record_stream(torch.cuda.current_stream())
             param.grad.data = new_grad_tensor
 
             self.__params_in_ipg_bucket.append(param)
@@ -1662,7 +1663,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.__avg_scatter_grads(self.__params_in_ipg_bucket)
             self.__partition_grads(self.__params_in_ipg_bucket)
 
-        self.__params_in_ipg_bucket.clear()
+            for p in self.__params_in_ipg_bucket:
+                p.record_stream(torch.cuda.current_stream())
+            self.__params_in_ipg_bucket.clear()
 
         # FIXME: get rid of this safely
         self.__reduce_and_partition_stream.synchronize()
@@ -1759,6 +1762,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         for group in self.__fp16_param_groups:
             for p in group:
                 if set_grads_to_None:
+                    if p.grad is not None:
+                        p.grad.record_stream(torch.cuda.current_stream())
                     p.grad = None
                 else:
                     if p.grad is not None:
@@ -1775,7 +1780,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                          op=op,
                                          group=self.model_parallel_group)
 
-    def get_grad_norm_direct(self, gradients, params, norm_type=2):
+    def get_grad_norm_direct(self,
+                             gradients: Iterable[Tensor],
+                             params: Iterable[Parameter],
+                             norm_type: Union[int,
+                                              float] = 2) -> float:
         """Clips gradient norm of an iterable of parameters.
 
         This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -1809,6 +1818,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             for g, p in zip(gradients, params):
                 if self.model_parallel_rank == 0 or is_model_parallel_parameter(p):
                     total_norm_cuda.add_(torch.pow(g.double().norm(2), 2))
+                    g.record_stream(torch.cuda.current_stream())
 
             # Sum across all model parallel GPUs.
             torch.distributed.all_reduce(total_norm_cuda,
@@ -1889,6 +1899,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         # release all the gradient since we have already created a necessary copy in dp_grad_partition
         self.zero_grad()
+
+        for grad in self.averaged_gradients[sub_group_id]:
+            grad.record_stream(torch.cuda.current_stream())
 
         self.averaged_gradients[sub_group_id] = None
 
@@ -2001,6 +2014,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if self.offload_optimizer:
             self.reset_cpu_buffers()
         else:
+            for group in self.averaged_gradients.values():
+                for grad in group:
+                    grad.record_stream(torch.cuda.current_stream())
             self.averaged_gradients = {}
 
         see_memory_usage('After overflow after clearing gradients', force=False)

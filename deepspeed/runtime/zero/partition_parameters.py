@@ -391,7 +391,7 @@ class AllGatherCoalescedHandle:
         param_offset = 0
         for param in self.__params:
             assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
-            partitions = []
+            partitions: List[Tensor] = []
             for rank in range(self.__world_size):
                 param_start = rank * param.ds_tensor.ds_numel
                 if param_start < param.ds_numel:
@@ -404,6 +404,9 @@ class AllGatherCoalescedHandle:
 
             param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
             param.ds_status = ZeroParamStatus.AVAILABLE
+
+            for part_to_copy in partitions:
+                part_to_copy.record_stream(torch.cuda.current_stream())
 
             param_offset += param.ds_tensor.ds_numel
 
