@@ -1410,9 +1410,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def overlapping_partition_gradients_reduce_epilogue(self):
         torch.cuda.synchronize()
-        self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         self.__reduce_and_partition_ipg_grads()
-        self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
         torch.cuda.synchronize()
 
@@ -1469,14 +1467,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     # Partition the parameter after creating the hook
                     param.partition()
         print_rank_0(f'[End] Create gradient reduction hooks')
-
-    def report_ipg_memory_usage(self, tag, param_elems):
-        elem_count = self.__elements_in_ipg_bucket + param_elems
-        percent_of_bucket_size = (100.0 *
-                                  elem_count) // self.__ipg_bucket_flat_buffer.numel()
-        see_memory_usage(
-            f"{tag}: elems in_bucket {self.__elements_in_ipg_bucket} param {param_elems} max_percent {percent_of_bucket_size}",
-            force=False)
 
     ###############Idependent Partition Gradient ########################
     @instrument_w_nvtx
