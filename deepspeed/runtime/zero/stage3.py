@@ -736,14 +736,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
 
-        # Unique ID for each parameter
-        self.param_id = {}
-        count = 0
-        for params_group in self.__fp16_param_groups:
-            for param in params_group:
-                self.param_id[id(param)] = count
-                count += 1
-
         # IPG
         self.__ipg_bucket_flat_buffer: Tensor = torch.empty(
             int(reduce_bucket_size),
@@ -762,9 +754,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         offset = 0
         for param in all_params:
-            param_id = self.get_param_id(param)
             self.__param_id_to_grad_partition[
-                param_id] = grad_partitions_flat_buffer.narrow(
+                param.ds_id] = grad_partitions_flat_buffer.narrow(
                     0,
                     offset,
                     param.ds_tensor.ds_numel)
@@ -780,8 +771,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             offset_within_group = 0
             for param in group:
                 self.__param_id_to_param_group_and_offset_within_group_buffer[
-                    self.get_param_id(param)] = (group_idx,
-                                                 offset_within_group)
+                    param.ds_id] = (group_idx,
+                                    offset_within_group)
                 offset_within_group += param.ds_tensor.ds_numel
 
         # will store the averaged gradients required by this parititon
@@ -1446,10 +1437,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self.averaged_gradients[i] = []
                 for param in sub_group:
                     if param.requires_grad:
-                        param_id = self.get_param_id(param)
-
                         self.averaged_gradients[i].append(
-                            self.__param_id_to_grad_partition[param_id].narrow(
+                            self.__param_id_to_grad_partition[param.ds_id].narrow(
                                 0,
                                 0,
                                 param.ds_tensor.numel()))
@@ -1496,10 +1485,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     # Partition the parameter after creating the hook
                     param.partition()
         print_rank_0(f'[End] Create gradient reduction hooks')
-
-    def get_param_id(self, param):
-        unique_id = id(param)
-        return self.param_id[unique_id]
 
     def report_ipg_memory_usage(self, tag, param_elems):
         elem_count = self.__elements_in_ipg_bucket + param_elems
@@ -1611,7 +1596,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 # this grad partition is empty - don't need to do anything
                 continue
 
-            grad_buffer = self.__param_id_to_grad_partition[self.get_param_id(param)]
+            grad_buffer = self.__param_id_to_grad_partition[param.ds_id]
             grad_dst = grad_buffer.narrow(0, 0, param.grad.numel())
             if self.micro_step_id == 0:  # don't accumulate
                 grad_dst.copy_(param.grad, non_blocking=True)
@@ -1639,8 +1624,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             offload_fp32_offsets = {}
 
             for param in params_to_release:
-                param_id = self.get_param_id(param)
-                i, dest_offset = self.__param_id_to_param_group_and_offset_within_group_buffer[param_id]
+                i, dest_offset = self.__param_id_to_param_group_and_offset_within_group_buffer[param.ds_id]
 
                 if self.is_gradient_accumulation_boundary:
                     if self._swappable_optimizer_subgroup(i):
