@@ -1654,7 +1654,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         for group in self.__fp16_param_groups:
             for p in group:
                 if set_grads_to_None:
-                    if p.grad is not None:
+                    if p.grad is not None and p.grad.is_cuda:
                         p.grad.record_stream(torch.cuda.current_stream())
                     p.grad = None
                 else:
