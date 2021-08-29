@@ -2082,10 +2082,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage(f"Before backward", force=False)
 
-        # TODO. fix for grad accumulation
-        for grad in self.__param_id_to_grad_partition.values():
-            grad.zero_()
-
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
         self.param_coordinator.reset_step()

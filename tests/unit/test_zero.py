@@ -498,19 +498,22 @@ def test_zero3_param_partitioning_base(
             # dloss_wrt_layer2 = layer3 * hidden1
             # dloss_wrt_layer1 = layer3 * layer2 * x
             if dist.get_rank() == 0:
-                assert torch.allclose(dloss_wrt_layer3.cuda(), create_tensor([2] * 8))
+                assert torch.allclose(dloss_wrt_layer3.cuda(),
+                                      (train_iter + 1) * create_tensor([2] * 8))
                 assert torch.allclose(dloss_wrt_layer2.cuda(),
-                                      create_tensor([3 * 1] * 8))
+                                      (train_iter + 1) * create_tensor([3 * 1] * 8))
                 assert torch.allclose(dloss_wrt_layer1.cuda(),
-                                      create_tensor([3 * 2 * 1] * 8))
+                                      (train_iter + 1) * create_tensor([3 * 2 * 1] * 8))
             elif dist.get_rank() == 1:
                 # parameters dont split evenly across ranks so rank 1 has a zero-padded
                 # partition
                 assert torch.allclose(dloss_wrt_layer3.cuda(),
-                                      create_tensor(([8] * 7) + [0]))
+                                      (train_iter + 1) * create_tensor(([8] * 7) + [0]))
                 assert torch.allclose(dloss_wrt_layer2.cuda(),
+                                      (train_iter + 1) *
                                       create_tensor(([6 * 2] * 7) + [0]))
                 assert torch.allclose(dloss_wrt_layer1.cuda(),
+                                      (train_iter + 1) *
                                       create_tensor(([6 * 4 * 1] * 7) + [0]))
             else:
                 raise RuntimeError("test has world size of two")
@@ -561,7 +564,7 @@ def test_zero3_param_partitioning_large_param(world_sz: int, param_sz: int):
         model.param.ds_tensor.data = torch.full_like(model.param.ds_tensor.data,
                                                      dist.get_rank())
 
-        for _ in range(3):  # test multiple iterations to cover prefetching
+        for train_iter in range(3):  # test multiple iterations to cover prefetching
             activation: Tensor = ds_engine(
                 torch.ones(param_sz,
                            dtype=torch.float16,
@@ -582,7 +585,9 @@ def test_zero3_param_partitioning_large_param(world_sz: int, param_sz: int):
             assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
             weight_gradient, = avgd_gradients[0]
 
-            assert torch.allclose(weight_gradient, torch.full_like(weight_gradient, 1))
+            assert torch.allclose(weight_gradient,
+                                  (train_iter + 1) * torch.full_like(weight_gradient,
+                                                                     1))
 
     _distributed_test()
 
