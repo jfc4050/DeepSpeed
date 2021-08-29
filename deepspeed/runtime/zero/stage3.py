@@ -1628,6 +1628,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     #############################################################################
     #############################################################################
 
+    @instrument_w_nvtx
     def zero_grad(self, set_grads_to_None=True):
         """
         Zero FP16 parameter grads.
@@ -1754,6 +1755,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                           self.__fp16_param_groups[i]))
         return norm_groups
 
+    @instrument_w_nvtx
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):
         partition_id = dist.get_rank(group=self.dp_process_group)
 
