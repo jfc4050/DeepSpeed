@@ -515,6 +515,10 @@ def test_zero3_param_partitioning_base(
             else:
                 raise RuntimeError("test has world size of two")
 
+        # TODO. add testing for this - for now we just call it to make sure it
+        # doesnt throw
+        ds_engine.optimizer.step()
+
     _test_zero3_param_partitioning()
 
 

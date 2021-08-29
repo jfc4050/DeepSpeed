@@ -1695,7 +1695,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     total_norm_cuda.add_(
                         torch.pow(g.cuda(non_blocking=True).double().norm(2),
                                   2))
-                    g.record_stream(torch.cuda.current_stream())
+                    if g.is_cuda:
+                        g.record_stream(torch.cuda.current_stream())
 
             # Sum across all model parallel GPUs.
             torch.distributed.all_reduce(total_norm_cuda,
@@ -1768,7 +1769,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # release all the gradient since we have already created a necessary copy in dp_grad_partition
         self.zero_grad()
 
-        for grad in self.averaged_gradients[sub_group_id]:
+        for grad in filter(lambda g: g.is_cuda, self.averaged_gradients[sub_group_id]):
             grad.record_stream(torch.cuda.current_stream())
 
         self.averaged_gradients[sub_group_id] = None
