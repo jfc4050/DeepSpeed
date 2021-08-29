@@ -669,8 +669,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.timers = timers
 
-        self.reduce_scatter = reduce_scatter
-
         self.dp_process_group = dp_process_group
 
         if mpu is None:
@@ -687,11 +685,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.postscale_gradients = postscale_gradients
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.micro_step_id = INITIAL_MICRO_STEP_ID
-
-        if self.reduce_scatter:
-            assert not self.allreduce_always_fp32, "allreduce_always_fp32 is not yet supported with ZeRO-2 with reduce scatter enabled"
-            assert self.gradient_predivide_factor == 1.0, "gradient_predivide_factor != 1.0 is not yet supported with ZeRO-2 with reduce scatter enabled"
-            assert self.postscale_gradients, "pre-scale gradients is not yet supported with ZeRO-2 with reduce scatter enabled"
 
         # Holds the mode parameter
         # The param.data may not hold any meaningful data
@@ -1517,31 +1510,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             self.__params_in_ipg_bucket.append(param)
 
-    def gradient_reduction_w_predivide(self, tensor):
-        dp_world_size = dist.get_world_size(group=self.dp_process_group)
-
-        tensor_to_allreduce = tensor
-
-        if self.allreduce_always_fp32:
-            tensor_to_allreduce = tensor.float()
-
-        if self.postscale_gradients:
-            if self.gradient_predivide_factor != 1.0:
-                tensor_to_allreduce.mul_(1. / self.gradient_predivide_factor)
-
-            dist.all_reduce(tensor_to_allreduce, group=self.dp_process_group)
-
-            if self.gradient_predivide_factor != dp_world_size:
-                tensor_to_allreduce.mul_(self.gradient_predivide_factor / dp_world_size)
-        else:
-            tensor_to_allreduce.div_(dp_world_size)
-            dist.all_reduce(tensor_to_allreduce, group=self.dp_process_group)
-
-        if self.allreduce_always_fp32 and tensor is not tensor_to_allreduce:
-            tensor.copy_(tensor_to_allreduce)
-
-        return tensor
-
     @instrument_w_nvtx
     @torch.no_grad()
     def __reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
@@ -1564,8 +1532,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 assert_ints_same_as_other_ranks(
                     [p.ds_id for p in self.__params_in_ipg_bucket])
 
-            self.__avg_scatter_grads(self.__params_in_ipg_bucket)
-            self.__partition_grads(self.__params_in_ipg_bucket)
+            grad_partitions = self.__avg_scatter_grads(self.__params_in_ipg_bucket)
+            self.__partition_grads(self.__params_in_ipg_bucket, grad_partitions)
 
             for p in self.__params_in_ipg_bucket:
                 p.record_stream(torch.cuda.current_stream())
@@ -1577,47 +1545,62 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> None:
         """average gradients and scatter partitions across ranks"""
-        if self.reduce_scatter:
-            grad_partitions_for_rank = reduce_scatter_coalesced(
-                [p.grad for p in params_to_reduce],
-                self.dp_process_group)
-            for param, grad_partition in zip(params_to_reduce, grad_partitions_for_rank):
-                param.grad.record_stream(torch.cuda.current_stream())
-                param.grad.data = grad_partition
-        else:
-            for param in params_to_reduce:
-                self.gradient_reduction_w_predivide(param.grad)
+        dtype = get_only_unique_item(p.grad.dtype for p in params_to_reduce)
+
+        full_grads_for_rank = [p.grad for p in params_to_reduce]
+        if self.allreduce_always_fp32:
+            full_grads_for_rank = [g.float() for g in full_grads_for_rank]
+
+        if self.postscale_gradients and self.gradient_predivide_factor != 1.0:
+            full_grads_for_rank = [
+                g.div(self.gradient_predivide_factor) for g in full_grads_for_rank
+            ]
+
+        grad_partitions_for_rank = reduce_scatter_coalesced(full_grads_for_rank,
+                                                            self.dp_process_group)
+
+        if self.postscale_gradients and self.gradient_predivide_factor != dist.get_world_size(
+                self.dp_process_group):
+            grad_partitions_for_rank = [
+                g.mul(self.gradient_predivide_factor) for g in grad_partitions_for_rank
+            ]
+
+        if self.allreduce_always_fp32:
+            grad_partitions_for_rank = [g.to(dtype) for g in grad_partitions_for_rank]
+
+        return grad_partitions_for_rank
 
     @instrument_w_nvtx
-    def __partition_grads(self, params_to_release: List[Parameter]) -> None:
-        for param in params_to_release:
+    def __partition_grads(self,
+                          params_to_release: List[Parameter],
+                          grad_partitions: List[Tensor]) -> None:
+        for param, grad_partition in zip(params_to_release, grad_partitions):
             if param.ds_tensor.ds_numel * dist.get_rank(
                     self.dp_process_group) > param.ds_numel:
                 # this grad partition is empty - don't need to do anything
                 continue
 
             grad_buffer = self.__param_id_to_grad_partition[param.ds_id]
-            grad_dst = grad_buffer.narrow(0, 0, param.grad.numel())
+            grad_dst = grad_buffer.narrow(0, 0, grad_partition.numel())
             if self.micro_step_id == 0:  # don't accumulate
-                grad_dst.copy_(param.grad, non_blocking=True)
+                grad_dst.copy_(grad_partition, non_blocking=True)
             elif grad_dst.is_cuda:
-                grad_dst.add_(param.grad)
+                grad_dst.add_(grad_partition)
             else:
                 # if dst is CPU, copy first to src device, do the addition
                 # there, then move back to dst. adding directly to cpu is very slow
-                tmp_grad_dst = torch.empty_like(param.grad)
+                tmp_grad_dst = torch.empty_like(grad_partition)
                 tmp_grad_dst.copy_(grad_dst, non_blocking=True)
-                tmp_grad_dst.add_(param.grad)
+                tmp_grad_dst.add_(grad_partition)
                 grad_dst.copy_(tmp_grad_dst, non_blocking=True)
 
             # Credit to our user David Minn
-            if param.grad is not None:
+            if grad_partition is not None:
                 self.__gradient_sum_for_inf_or_nan_tracking.add_(
-                    param.grad.data.float().sum())
+                    grad_partition.float().sum())
 
             param.grad.record_stream(torch.cuda.current_stream())
-
-            param.grad.data = grad_buffer
+            param.grad = None
 
         if self.offload_optimizer and self.swap_optimizer:
             offload_fp32_gradients = {}
@@ -1632,7 +1615,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                             offload_fp32_gradients[i] = []
                             offload_fp32_offsets[i] = []
 
-                        offload_fp32_gradients[i].append(param.grad.view(-1).float())
+                        offload_fp32_gradients[i].append(grad_partition.view(-1).float())
                         offload_fp32_offsets[i].append(dest_offset)
 
             for i in offload_fp32_gradients.keys():
