@@ -1647,6 +1647,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                          op=op,
                                          group=self.model_parallel_group)
 
+    @instrument_w_nvtx
     def get_grad_norm_direct(self,
                              gradients: Iterable[Tensor],
                              params: Iterable[Parameter],
@@ -1681,14 +1682,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                             op=torch.distributed.ReduceOp.MAX)
             total_norm = total_norm_cuda[0].item()
         else:
-            total_norm_cuda = torch.cuda.FloatTensor([0])
+            grad_norms = []
             for g, p in zip(gradients, params):
                 if self.model_parallel_rank == 0 or is_model_parallel_parameter(p):
-                    total_norm_cuda.add_(
-                        torch.pow(g.cuda(non_blocking=True).double().norm(2),
-                                  2))
-                    if g.is_cuda:
-                        g.record_stream(torch.cuda.current_stream())
+                    grad_norms.append(g.cuda(non_blocking=True).double().norm(2))
+
+            total_norm_cuda = torch.sum(torch.pow(torch.stack(grad_norms), 2))
 
             # Sum across all model parallel GPUs.
             torch.distributed.all_reduce(total_norm_cuda,
@@ -1698,7 +1697,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self._model_parallel_all_reduce(tensor=total_norm_cuda,
                                             op=torch.distributed.ReduceOp.SUM)
 
-            total_norm = total_norm_cuda[0].item()**(1. / norm_type)
+            total_norm = total_norm_cuda.item()**(1. / norm_type)
 
         if total_norm == float(
                 'inf') or total_norm == -float('inf') or total_norm != total_norm:
@@ -1739,12 +1738,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def _get_norm_groups(self):
-        norm_groups = []
-        for i in range(len(self.__fp16_param_groups)):
-            norm_groups.append(
-                self.get_grad_norm_direct(self.averaged_gradients[i],
-                                          self.__fp16_param_groups[i]))
-        return norm_groups
+        return [
+            self.get_grad_norm_direct(self.averaged_gradients[i],
+                                      self.__fp16_param_groups[i])
+            for i in range(len(self.__fp16_param_groups))
+        ]
 
     @instrument_w_nvtx
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):
