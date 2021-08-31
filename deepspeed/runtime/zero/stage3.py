@@ -1413,13 +1413,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             @instrument_w_nvtx
             def _run_after_backward_function(sub_module):
                 if sub_module.ds_grads_remaining == 0:
-                    see_memory_usage(
-                        f"After sub module backward function {module.__class__.__name__} {module.id} before release",
-                        force=False)
-                    self.param_coordinator.release_sub_module(module)
-                    see_memory_usage(
-                        f"After sub module backward function {module.__class__.__name__} {module.id} after release",
-                        force=False)
+                    self.post_sub_module_backward_function(sub_module)
 
             return _apply_to_tensors_only(module,
                                           PostBackwardFunction,
@@ -1446,6 +1440,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
+            force=False)
+
+    def post_sub_module_backward_function(self, sub_module):
+        see_memory_usage(
+            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} before release",
+            force=False)
+        self.param_coordinator.release_sub_module(sub_module)
+        see_memory_usage(
+            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} after release",
             force=False)
 
     def _optimizer_step(self, sub_group_id):
