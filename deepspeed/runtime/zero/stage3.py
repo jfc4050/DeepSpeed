@@ -1160,6 +1160,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return sub_groups
 
+    # def reset_ds_tensor(self):
+    #     for name, param in self.module.named_parameters(recurse=True):
+    #         assert hasattr(param,'ds_id'), "Parameters have not been converted to be Zero 3 compatible"
+    #         assert (param.ds_status == ZeroParamStatus.NOT_AVAILABLE), "All the parameters must have been partitioned by now"
+    #         param.ds_tensor.data = param.data
+
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
 
