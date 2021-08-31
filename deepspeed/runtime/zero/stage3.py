@@ -569,20 +569,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         util_ops = UtilsBuilder().load()
         self.flatten = util_ops.flatten
         self.unflatten = util_ops.unflatten
-
-        # get the parameter dtype
-        param_dtypes = set()
-        for param_group in self.optimizer.param_groups:
-            for param in param_group["params"]:
-                param_dtypes.add(param.dtype)
-        assert len(param_dtypes) == 1, param_dtypes
-        self.__param_dtype, = param_dtypes
+        self.dtype = self.optimizer.param_groups[0]['params'][0].dtype
 
         if not all(is_zero_param(p) for p in module.parameters()):
             group = None
             if mpu:
                 group = mpu.get_data_parallel_group()
-            Init(module=module, data_parallel_group=group, dtype=self.__param_dtype)
+            Init(module=module, data_parallel_group=group, dtype=self.dtype)
 
         for m in module.modules():
             _init_external_params(m)
@@ -740,7 +733,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # IPG
         self.__ipg_bucket_flat_buffer: Tensor = torch.empty(
             int(reduce_bucket_size),
-            dtype=self.__param_dtype,
+            dtype=self.dtype,
             device=torch.cuda.current_device())
 
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
@@ -749,7 +742,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         grad_partitions_flat_buffer: Tensor = torch.zeros(
             sum(p.ds_tensor.ds_numel for p in all_params),
-            dtype=self.__param_dtype,
+            dtype=self.dtype,
             device=self.device,
             pin_memory=self.offload_optimizer_pin_memory)
 
@@ -783,8 +776,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.__init_reduce_and_remove_grad_hooks()
 
         # we may have a way of fusing dynamic scale. Do not support for now
-        if self.__param_dtype == torch.float or not dynamic_loss_scale:
-            loss_scale_value = 1.0 if self.__param_dtype == torch.float else static_loss_scale
+        if self.dtype == torch.float or not dynamic_loss_scale:
+            loss_scale_value = 1.0 if self.dtype == torch.float else static_loss_scale
 
             self.dynamic_loss_scale = False
             self.loss_scaler = LossScaler(scale=loss_scale_value)
@@ -882,7 +875,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                              force=False)
                 self.param_groups_fp16_flat_cpu_memory.append(
                     torch.empty(int(flat_buffer_size),
-                                dtype=self.__param_dtype,
+                                dtype=self.dtype,
                                 pin_memory=True))
             else:
                 print_rank_0(
@@ -891,7 +884,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                 self.param_groups_fp16_flat_cpu_memory.append(
                     torch.empty(1,
-                                dtype=self.__param_dtype))
+                                dtype=self.dtype))
 
     def __create_fp16_partitions_with_defragmentation(self, subgroup_size: int) -> None:
         create_fp16_flat_reuse_buffer = False
