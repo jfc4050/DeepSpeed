@@ -1717,6 +1717,34 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return grad_partitions_for_rank
 
+    def complete_grad_norm_calculation_for_cpu_offload(self, params):
+        total_norm = 0.0
+        norm_type = 2.0
+        for p in params:
+            if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
+                param_id = self.get_param_id(p)
+                if param_id in self.norm_for_param_grads.keys():
+                    param_norm = self.norm_for_param_grads[param_id]
+                    total_norm += param_norm.item()**2
+
+        # Sum across all model parallel GPUs.
+        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+
+        torch.distributed.all_reduce(total_norm_cuda,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=self.dp_process_group)
+
+        self._model_parallel_all_reduce(tensor=total_norm_cuda,
+                                        op=torch.distributed.ReduceOp.SUM)
+
+        total_norm = total_norm_cuda[0].item()**(1. / norm_type)
+
+        if total_norm == float(
+                'inf') or total_norm == -float('inf') or total_norm != total_norm:
+            total_norm = -1
+
+        return total_norm
+
     @instrument_w_nvtx
     def __partition_grads(self,
                           params_to_release: List[Parameter],
