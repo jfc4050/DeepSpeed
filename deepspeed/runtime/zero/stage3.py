@@ -743,7 +743,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             sum(p.ds_tensor.ds_numel for p in all_params),
             dtype=self.__param_dtype,
             device=self.device,
-            pin_memory=self.offload_param_pin_memory)
+            pin_memory=self.offload_optimizer_pin_memory)
 
         offset = 0
         for param in all_params:
