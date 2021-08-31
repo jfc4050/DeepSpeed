@@ -1774,6 +1774,139 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     gradient_offsets=offload_fp32_offsets[i],
                     gradient_tensors=offload_fp32_gradients[i])
 
+    def zero_reduced_gradients(self, partition_id, i):
+        def are_all_related_partitions_reduced(params_id):
+            for partition_id in self.param_to_partition_ids[i][params_id]:
+                if not self.is_partition_reduced[i][partition_id]:
+                    return False
+            return True
+
+        for params_id in self.is_grad_computed[i][partition_id]:
+            if are_all_related_partitions_reduced(params_id):
+                self.param_dict[params_id].grad = None
+
+    def flatten_and_print(self, message, tensors, start=0, n=5):
+        flatten_tensor = self.flatten(tensors)
+
+        def print_func():
+            logger.info(flatten_tensor.contiguous().view(-1).narrow(0, start, n))
+
+        self.sequential_execution(print_func, message)
+
+    def get_grads_to_reduce(self, i, partition_id):
+        def get_reducable_portion(key):
+            grad = self.param_dict[key].grad
+            total_elements = grad.numel()
+            start = self.grad_start_offset[i][partition_id][key]
+            num_elements = min(
+                total_elements - start,
+                self.partition_size[i] -
+                self.grad_partition_insertion_offset[i][partition_id][key])
+            if not pg_correctness_test:
+                if num_elements == total_elements:
+                    return grad
+                else:
+                    return grad.contiguous().view(-1).narrow(0,
+                                                             int(start),
+                                                             int(num_elements))
+            else:
+                if num_elements == total_elements:
+                    return grad.clone()
+                else:
+                    return grad.clone().contiguous().view(-1).narrow(
+                        0,
+                        int(start),
+                        int(num_elements))
+
+        grads_to_reduce = []
+        for key in self.is_grad_computed[i][partition_id]:
+            grad = get_reducable_portion(key)
+            grads_to_reduce.append(grad)
+        return grads_to_reduce
+
+    def sequential_execution(self, function, message, group=None):
+        if group is None:
+            group = self.dp_process_group
+        if dist.get_rank(group=group) == 0:
+            logger.info(message)
+        for id in range(dist.get_world_size(group=group)):
+            if id == dist.get_rank(group=group):
+                function()
+            dist.barrier(group=group)
+
+    def set_none_gradients_to_zero(self, i, partition_id):
+        for param_id in self.is_grad_computed[i][partition_id]:
+            param = self.param_dict[param_id]
+            if param.grad is None:
+                param.grad = torch.zero_like(param)
+
+    ######################Reduction Related Methods##############################
+
+    def allreduce_bucket(self, bucket, allreduce_always_fp32=False, rank=None, log=None):
+        rank = None
+        tensor = self.flatten(bucket)
+
+        tensor_to_allreduce = tensor
+
+        if pg_correctness_test:
+            allreduce_always_fp32 = True
+
+        if allreduce_always_fp32:
+            tensor_to_allreduce = tensor.float()
+
+        tensor_to_allreduce.div_(dist.get_world_size(group=self.dp_process_group))
+
+        if rank is None:
+            #    "All Reducing"
+            dist.all_reduce(tensor_to_allreduce, group=self.dp_process_group)
+        else:
+            global_rank = _get_global_rank(self.dp_process_group, rank)
+            dist.reduce(tensor_to_allreduce, global_rank, group=self.dp_process_group)
+
+        if allreduce_always_fp32 and tensor is not tensor_to_allreduce:
+            if rank is None or rank == dist.get_rank(group=self.dp_process_group):
+                tensor.copy_(tensor_to_allreduce)
+
+        return tensor
+
+    # if rank is specified do a reduction instead of an allreduce
+    def allreduce_and_copy(self, small_bucket, rank=None, log=None):
+        with torch.cuda.stream(self.reduction_stream):
+            allreduced = self.allreduce_bucket(small_bucket, rank=rank, log=log)
+            if rank is None or rank == dist.get_rank(group=self.dp_process_group):
+                for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
+                    buf.copy_(synced)
+
+    def allreduce_no_retain(self,
+                            bucket,
+                            numel_per_bucket=500000000,
+                            rank=None,
+                            log=None):
+        small_bucket = []
+        numel = 0
+        for tensor in bucket:
+            small_bucket.append(tensor)
+            numel = numel + tensor.numel()
+            if numel > numel_per_bucket:
+                self.allreduce_and_copy(small_bucket, rank=rank, log=None)
+                small_bucket = []
+        if len(small_bucket) > 0:
+            self.allreduce_and_copy(small_bucket, rank=rank, log=log)
+
+    # allows using reduction of gradients instead of using all_reduce
+    def buffered_reduce_fallback(self,
+                                 rank,
+                                 grads,
+                                 elements_per_buffer=500000000,
+                                 log=None):
+        split_buckets = split_half_float_double(grads)
+
+        for i, bucket in enumerate(split_buckets):
+            self.allreduce_no_retain(bucket,
+                                     numel_per_bucket=elements_per_buffer,
+                                     rank=rank,
+                                     log=log)
+
     #############################################################################
     #############################################################################
     #############################################################################
