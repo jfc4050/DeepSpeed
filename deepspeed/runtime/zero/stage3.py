@@ -776,6 +776,71 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                     offset_within_group)
                 offset_within_group += param.ds_tensor.ds_numel
 
+        if dist.get_rank() == 0:
+            logger.info(f"optimizer state initialized")
+
+        self.param_dict = {}
+
+        # map between param_id and bool to specify if a param is in this partition
+        self.is_param_in_current_partition = {}
+
+        self.contiguous_gradients = contiguous_gradients
+        self.extra_large_param_to_reduce = None
+        self.grads_in_ipg_bucket = []
+        self.params_in_ipg_bucket = []
+        self.elements_in_ipg_bucket = 0
+        self.params_already_reduced = []
+        self.is_gradient_accumulation_boundary = True
+        self.previous_reduced_grads = None
+
+        # simplified param id
+        self.param_id = {}
+
+        count = 0
+        for i, params_group in enumerate(self.fp16_groups):
+            for param in params_group:
+                unique_id = id(param)
+                self.param_id[unique_id] = count
+                self.param_dict[count] = param
+                self.params_already_reduced.append(False)
+                count = count + 1
+
+        #Largest partitioned param
+        largest_partitioned_param_numel = max([
+            max([tensor.numel() for tensor in fp16_partitioned_group])
+            for fp16_partitioned_group in self.fp16_partitioned_groups
+        ])
+        print_rank_0(
+            f'Largest partitioned param numel = {largest_partitioned_param_numel}',
+            force=False)
+
+        see_memory_usage(f"Before Set Grad positions", force=False)
+
+        self.grad_position = {}
+        self.set_grad_positions()
+        see_memory_usage(f"Before CPU Offload initialization", force=False)
+
+        self.grads_in_partition = None
+
+        if self.offload_optimizer:
+            self.accumulated_grads_in_cpu = {}
+            self.norm_for_param_grads = {}
+            self.local_overflow = False
+            self.temp_grad_buffer_for_gpu_offload = torch.zeros(
+                largest_partitioned_param_numel,
+                device=torch.cuda.current_device(),
+                dtype=self.dtype)
+            self.temp_grad_gpu_buffer = torch.zeros(largest_partitioned_param_numel,
+                                                    device=torch.cuda.current_device(),
+                                                    dtype=self.dtype)
+        see_memory_usage(f"After CPU Offload initialization", force=False)
+
+        # stores if a partition has been reduced in this step
+        self.is_partition_reduced = {}
+
+        # stores if a grad in a partition has been computed or not
+        self.is_grad_computed = {}
+
         # will store the averaged gradients required by this parititon
         self.averaged_gradients: Dict[int, List[Tensor]] = {}
 
@@ -1634,6 +1699,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     param.partition()
         print_rank_0(f'[End] Create gradient reduction hooks')
 
+    def get_param_id(self, param):
+        unique_id = id(param)
+        return self.param_id[unique_id]
+
     ###############Idependent Partition Gradient ########################
     @instrument_w_nvtx
     @torch.no_grad()
@@ -2233,11 +2302,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def _get_norm_groups(self):
-        return [
-            self.get_grad_norm_direct(self.averaged_gradients[i],
-                                      self.fp16_groups[i])
-            for i in range(len(self.fp16_groups))
-        ]
+        norm_groups = []
+        for i, group in enumerate(self.fp16_groups):
+            if self.offload_optimizer:
+                norm_groups.append(
+                    self.complete_grad_norm_calculation_for_cpu_offload(
+                        self.fp16_groups[i]))
+            else:
+                norm_groups.append(
+                    self.get_grad_norm_direct(self.averaged_gradients[i],
+                                              self.fp16_groups[i]))
+        return norm_groups
 
     @instrument_w_nvtx
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):
