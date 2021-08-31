@@ -651,15 +651,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # parameters smaller than the threshold will be collectively gathered at the
         # end of the optimizer step and will be kept till the end of the backward pass
         # TODO maybe worth just replicating these parameters and doing all reduce for them
-        self.__persistent_parameters = []
-        for param in filter(lambda p: p.ds_numel < param_persistence_threshold,
-                            iter_params(self.module,
-                                        recurse=True)):
-            param.ds_persist = True
-            self.__persistent_parameters.append(param)
-        print_rank_0(
-            f"ZeRO 3: Total persistent parameters: {sum(p.ds_numel for p in self.__persistent_parameters)} in {len(self.__persistent_parameters)} params",
-            force=False)
+        self.persistence_threshold = int(param_persistence_threshold)
+
+        self.persistent_parameters = self.persistent_parameters()
 
         self.setup_zero_stage3_hooks()
 
@@ -1289,6 +1283,22 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # Add top todule to stack trace
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(self.module)
+
+    def persistent_parameters(self):
+        persistent_params = []
+        total_persistent_parameters = 0
+        params_count = 0
+        for _, param in self.module.named_parameters(recurse=True):
+            if param.ds_numel < self.persistence_threshold:
+                params_count += 1
+                param.ds_persist = True
+                persistent_params.append(param)
+                total_persistent_parameters += param.ds_numel
+
+        print_rank_0(
+            f"ZeRO 3: Total persistent parameters: {total_persistent_parameters} in {params_count} params",
+            force=False)
+        return persistent_params
 
     def _register_hooks_recursively(self, module: Module, count=[0]) -> None:
         my_count = count[0]
@@ -2013,8 +2023,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def _post_step(self, timer_names=set()):
         #Gathering persisting parameters
-        if len(self.__persistent_parameters) > 0:
-            self.__persistent_parameters[0].all_gather(self.__persistent_parameters)
+        if len(self.persistent_parameters) > 0:
+            self.persistent_parameters[0].all_gather(self.persistent_parameters)
 
         if self.swap_optimizer:
             self.optimizer_swapper.log_timers()
@@ -2353,16 +2363,16 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             state_dict_list[dist.get_rank(group=self.dp_process_group)],
             load_optimizer_states=load_optimizer_states)
 
-        if len(self.__persistent_parameters) > 0:
-            self.__persistent_parameters[0].partition(self.__persistent_parameters)
-            self.__persistent_parameters[0].all_gather(self.__persistent_parameters)
+        if len(self.persistent_parameters) > 0:
+            self.persistent_parameters[0].partition(self.persistent_parameters)
+            self.persistent_parameters[0].all_gather(self.persistent_parameters)
 
     def save_checkpoint_prologue(self):
         self._partition_all_parameters()
 
     def save_checkpoint_epilogue(self):
-        if len(self.__persistent_parameters) > 0:
-            self.__persistent_parameters[0].all_gather(self.__persistent_parameters)
+        if len(self.persistent_parameters) > 0:
+            self.persistent_parameters[0].all_gather(self.persistent_parameters)
 
 
 def estimate_zero3_model_states_mem_needs(total_params,
