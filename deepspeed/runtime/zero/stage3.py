@@ -1363,15 +1363,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                     item.all_gather()
 
-            see_memory_usage(
-                f"After sub module function {module.__class__.__name__} {module.id} before release",
-                force=False)
-            self.param_coordinator.release_sub_module(module)
-            see_memory_usage(
-                f"After sub module function {module.__class__.__name__}  {module.id} after release",
-                force=False)
+            self.post_sub_module_forward_function(module)
 
-        @instrument_w_nvtx
         def _pre_backward_module_hook(module, inputs, output):
             @instrument_w_nvtx
             def _run_before_backward_function(sub_module):
@@ -1391,7 +1384,29 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                           _run_before_backward_function,
                                           output)
 
-        @instrument_w_nvtx
+        #This is an alternate to doing _post_backward_module_hook
+        #it uses tensor.register_hook instead of using torch.autograd.Function
+        def _alternate_post_backward_module_hook(module, inputs):
+            module.ds_grads_remaining = 0
+
+            #print(f"Before Forward {module.__class__.__name__}")
+
+            def _run_after_backward_hook(*unused):
+                module.ds_grads_remaining = module.ds_grads_remaining - 1
+                if module.ds_grads_remaining == 0:
+                    #print(f"After backward {module.__class__.__name__}")
+                    self.post_sub_module_backward_function(module)
+
+            def _run_before_forward_function(input):
+                if input.requires_grad:
+                    module.ds_grads_remaining += 1
+
+            return _apply_forward_and_backward_to_tensors_only(
+                module,
+                _run_before_forward_function,
+                _run_after_backward_hook,
+                inputs)
+
         def _post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
 
@@ -1422,7 +1437,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # post backward hook
         module.register_forward_pre_hook(_post_backward_module_hook)
 
-    @instrument_w_nvtx
+    def post_sub_module_forward_function(self, sub_module):
+        see_memory_usage(
+            f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
+            force=False)
+
+        self.param_coordinator.release_sub_module(sub_module)
+
+        see_memory_usage(
+            f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
+            force=False)
+
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
