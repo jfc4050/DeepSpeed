@@ -1300,7 +1300,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             force=False)
         return persistent_params
 
-    def _register_hooks_recursively(self, module: Module, count=[0]) -> None:
+    def _register_hooks_recursively(self, module, count=[0]):
         my_count = count[0]
         module.id = my_count
 
@@ -1312,18 +1312,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         @instrument_w_nvtx
         def _pre_forward_module_hook(module, *args):
-            see_memory_usage(f"Before sub module function {module.__class__.__name__}",
-                             force=False)
-
-            global FWD_MODULE_STACK
-            FWD_MODULE_STACK.append(module)
-
-            if not self.param_coordinator.trace_complete:
-                self.param_coordinator.record_trace(module)
-            self.param_coordinator.fetch_sub_module(module)
-            see_memory_usage(
-                f"Before sub module function {module.__class__.__name__} after fetch",
-                force=False)
+            self.pre_sub_module_forward_function(module)
 
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
@@ -1373,9 +1362,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 # counting to support this scenario
                 #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
                 if sub_module.applied_pre_backward_ref_cnt > 0:
-                    if not self.param_coordinator.trace_complete:
-                        self.param_coordinator.record_trace(sub_module)
-                    self.param_coordinator.fetch_sub_module(sub_module)
+                    self.pre_sub_module_backward_function(sub_module)
                     sub_module.applied_pre_backward_ref_cnt -= 1
                 #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
 
@@ -1431,6 +1418,21 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # post backward hook
         module.register_forward_pre_hook(_post_backward_module_hook)
 
+    def pre_sub_module_forward_function(self, sub_module):
+        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}",
+                         force=False)
+
+        global FWD_MODULE_STACK
+        FWD_MODULE_STACK.append(sub_module)
+
+        if not self.param_coordinator.trace_complete:
+            self.param_coordinator.record_trace(sub_module)
+        self.param_coordinator.fetch_sub_module(sub_module)
+
+        see_memory_usage(
+            f"Before sub module function {sub_module.__class__.__name__} after fetch",
+            force=False)
+
     def post_sub_module_forward_function(self, sub_module):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
@@ -1441,6 +1443,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
             force=False)
+
+    def pre_sub_module_backward_function(self, sub_module):
+        if not self.param_coordinator.trace_complete:
+            self.param_coordinator.record_trace(sub_module)
+        self.param_coordinator.fetch_sub_module(sub_module)
 
     def post_sub_module_backward_function(self, sub_module):
         see_memory_usage(
