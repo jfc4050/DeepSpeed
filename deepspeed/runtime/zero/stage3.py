@@ -1564,16 +1564,19 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             grad_buffer = self.__param_id_to_grad_partition[param.ds_id]
             grad_dst = grad_buffer.narrow(0, 0, grad_partition.numel())
             if self.micro_step_id == 0:  # don't accumulate
-                grad_dst.copy_(grad_partition, non_blocking=True)
+                with torch.cuda.nvtx.range("grad_copy"):
+                    grad_dst.copy_(grad_partition, non_blocking=True)
             elif grad_dst.is_cuda:
-                grad_dst.add_(grad_partition)
+                with torch.cuda.nvtx.range("grad_add_cuda_dst"):
+                    grad_dst.add_(grad_partition)
             else:
                 # if dst is CPU, copy first to src device, do the addition
                 # there, then move back to dst. adding directly to cpu is very slow
-                tmp_grad_dst = torch.empty_like(grad_partition)
-                tmp_grad_dst.copy_(grad_dst, non_blocking=True)
-                tmp_grad_dst.add_(grad_partition)
-                grad_dst.copy_(tmp_grad_dst, non_blocking=True)
+                with torch.cuda.nvtx.range("grad_add_cpu_dst"):
+                    tmp_grad_dst = torch.empty_like(grad_partition)
+                    tmp_grad_dst.copy_(grad_dst, non_blocking=True)
+                    tmp_grad_dst.add_(grad_partition)
+                    grad_dst.copy_(tmp_grad_dst, non_blocking=True)
 
             # Credit to our user David Minn
             if grad_partition is not None:
