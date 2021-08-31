@@ -1778,6 +1778,59 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     #############################################################################
     #############################################################################
 
+    # views the tensor as multiple partitions and returns
+    # those partitions
+    def get_data_parallel_partitions(self, tensor):
+        partitions = []
+
+        dp = dist.get_world_size(group=self.dp_process_group)
+        dp_id = dist.get_rank(group=self.dp_process_group)
+
+        total_num_elements = tensor.numel()
+
+        base_size = total_num_elements // dp
+        remaining = total_num_elements % dp
+
+        start = 0
+        for id in range(dp):
+            partition_size = base_size
+            if id < remaining:
+                partition_size = partition_size + 1
+            partitions.append(tensor.narrow(0, start, partition_size))
+            start = start + partition_size
+        return partitions
+
+    def get_partition_info(self, tensor_list, partition_size, partition_id):
+        params_in_partition = []
+        params_not_in_partition = []
+
+        start_index = partition_size * partition_id
+        end_index = partition_size * (partition_id + 1)
+
+        current_index = 0
+        first_offset = 0
+
+        for tensor in tensor_list:
+
+            tensor_size = tensor.numel()
+
+            if (current_index >= start_index and current_index < end_index):
+                params_in_partition.append(tensor)
+
+            elif start_index > current_index and start_index < (current_index +
+                                                                tensor_size):
+                params_in_partition.append(tensor)
+
+                assert (first_offset == 0), "This can happen either zero or only once as this must be the first tensor in the partition"
+                first_offset = start_index - current_index
+
+            else:
+                params_not_in_partition.append(tensor)
+
+            current_index = current_index + tensor_size
+
+        return params_in_partition, params_not_in_partition, first_offset
+
     @instrument_w_nvtx
     def zero_grad(self, set_grads_to_None=True):
         """
@@ -1863,6 +1916,65 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             total_norm = -1
 
         return total_norm
+
+    # creates a flat fused tensor from the tensor list starting at the first_offset
+    # in the first tensor of the list. If there are not enough elements in the tensor
+    # list then the flat tensor will be padded with zeros
+    def get_flat_partition(self,
+                           tensor_list,
+                           first_offset,
+                           partition_size,
+                           return_tensor_list=False):
+        flat_tensor_list = []
+        current_size = 0
+        for i, tensor in enumerate(tensor_list):
+            if tensor.grad is None:
+                tensor.grad = torch.zeros_like(tensor)
+
+            tensor = tensor.grad
+            num_elements = tensor.numel()
+            tensor_offset = 0
+
+            # we need to offset to get to the right element
+            if i == 0 and first_offset > 0:
+                tensor_offset = first_offset
+                num_elements = num_elements - tensor_offset
+
+            # we dont need all elements of the tensor
+            if num_elements > (partition_size - current_size):
+                num_elements = partition_size - current_size
+
+            # we need a narrow view of the tensor based on the tensor offset and number of elements that
+            # we need from this tensor
+            if tensor_offset > 0 or num_elements < tensor.numel():
+                flat_tensor_list.append(tensor.contiguous().view(-1).narrow(
+                    0,
+                    int(tensor_offset),
+                    int(num_elements)))
+            else:
+                flat_tensor_list.append(tensor)
+
+            current_size = current_size + num_elements
+
+        # this means its the last partition and does not align with the dp boundary. We need to pad before flattening
+        if current_size < partition_size:
+            flat_tensor_list.append(
+                torch.zeros(int(partition_size - current_size),
+                            dtype=tensor_list[0].dtype,
+                            device=tensor_list[0].device))
+
+        if return_tensor_list:
+            return flat_tensor_list
+
+        return self.flatten(flat_tensor_list)
+
+    def free_grad_in_param_list(self, param_list):
+        for p in param_list:
+            p.grad = None
+
+    def reset_cpu_buffers(self):
+        self.norm_for_param_grads = {}
+        self.local_overflow = False
 
     def log_timers(self, timer_names):
         if self.timers is None:
@@ -2123,6 +2235,39 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self._post_step(timer_names)
         return
 
+    def dump_pre_step_gradients(self, debug_fp32_grads):
+        # Dump gradient norms for debbuging
+        for i, _ in enumerate(self.fp16_groups):
+            print(f'Pre-Step Dump Norms for Group {i} FP16P, FP16G, FP32G, FP32GUC')
+            for fp16_param, fp32_grad in zip(self.fp16_groups[i], debug_fp32_grads[i]):
+                param_id = self.get_param_id(fp16_param)
+                fp16_grad_norm = self.debug_fp16_grads[i][param_id]
+
+                fp32_grad_norm = [float(t.data.float().norm(2)) for t in fp32_grad]
+                norm_list = [fp16_grad_norm, fp32_grad_norm]
+                print(f'Pre-Step Norms {i} {param_id} = {norm_list}')
+
+    def dump_post_step_gradients(self):
+        # Dump gradient norms for debbuging
+        for i, group in enumerate(self.fp16_groups):
+            print(
+                f'Post-Step Dump Norms for Group {i} FP16P, FP16DS, FP16FLAT, FP32FLAT')
+            unflat_fp16 = self.unflatten(self.fp16_groups_flat[i], self.fp16_groups[i])
+            unflat_fp32 = self.unflatten(self.fp32_partitioned_groups_flat[i],
+                                         self.fp16_groups[i])
+            for j, p in enumerate(self.fp16_groups[i]):
+                param_id = self.get_param_id(p)
+                param_norm = float(p.data.float().norm(2))
+                ds_norm = float(p.ds_tensor.data.float().norm(2))
+
+                unflat_norm = [
+                    float(t.data.float().norm(2))
+                    for t in [unflat_fp16[j],
+                              unflat_fp32[j]]
+                ]
+                norm_list = [param_norm, ds_norm] + unflat_norm
+                print(f'Post-Step Norms {i} {param_id} = {norm_list}')
+
     @instrument_w_nvtx
     def unscale_and_clip_grads(self, sub_group_id, norm_groups):
 
@@ -2158,6 +2303,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             if p.grad is not None and self._has_inf_or_nan(p.grad.data):
                 return True
 
+        return False
+
+    def has_overflow_partitioned_grads_serial(self):
+        for i in range(len(self.fp16_groups)):
+            for j, grad in enumerate(self.averaged_gradients[i]):
+                if grad is not None and self._has_inf_or_nan(grad.data, j):
+                    return True
         return False
 
     @instrument_w_nvtx
@@ -2279,6 +2431,49 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     loss_scale = property(_get_loss_scale, _set_loss_scale)
     cur_scale = property(_get_loss_scale, _set_loss_scale)
 
+    def _get_lean_tensors(self, padded_flattened_tensor, group_tensors, paddings):
+        # Remove paddings from flattened tensor
+        individual_tensors = self.unflatten(padded_flattened_tensor, group_tensors)
+        lean_lengths = [t.numel() - pad for t, pad in zip(group_tensors, paddings)]
+        lean_tensors = [t[:len] for t, len in zip(individual_tensors, lean_lengths)]
+        #logger.info(f'rank {dist.get_rank()}: lean_tensors = {[t.numel() for t in lean_tensors]}')
+        return lean_tensors
+
+    #TODO REVISIT this for stage 3
+    def get_lean_optimizer_state(self):
+        # Return optimizer states after removing paddings.
+        # This method assumes that each param group contains a single flattened tensor.
+        optimizer_groups_state = []
+
+        for i, group in enumerate(self.optimizer.param_groups):
+            p = group['params'][0]
+            lean_state = {}
+            for key, value in self.optimizer.state[p].items():
+                if torch.is_tensor(value):
+                    padded_lens = [t.numel() for t in self.fp16_partitioned_groups[i]]
+                    lean_state[key] = self._get_lean_tensors(
+                        value,
+                        self.fp16_partitioned_groups[i],
+                        self.groups_padding[i])
+                    lean_flat_len = sum([t.numel() for t in lean_state[key]])
+                else:
+                    lean_state[key] = value
+
+            optimizer_groups_state.append(lean_state)
+
+        return optimizer_groups_state
+
+    def get_groups_without_padding(self, groups_with_padding):
+        # Return group tensor after removing paddings added for alignment to DP world size.
+        groups_without_padding = []
+        for i, group in enumerate(groups_with_padding):
+            lean_group = self._get_lean_tensors(group,
+                                                self.fp16_partitioned_groups[i],
+                                                self.groups_padding[i])
+            groups_without_padding.append(lean_group)
+
+        return groups_without_padding
+
     def _set_fp32_optimizer_param_groups(self):
         for sub_group_id, _ in enumerate(self.fp16_groups):
             param_group_id = self.sub_group_to_group_id[sub_group_id]
@@ -2327,6 +2522,82 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return self._rigid_state_dict()
 
+
+# Restore base optimizer fp32 weights from checkpoint by:
+# 1) Merging fp32 weights from checkpoints of all partitions
+# 2) Extracting fp32 weights for current partition from merged weights
+# 3) Using extracted weights to update base optimizer weights directly.
+
+    def _restore_from_fp32_weights(self, all_state_dict):
+
+        flat_local_partition = []
+        for i in range(len(self.fp32_partitioned_groups_flat)):
+            merged_partitions = [sd['fp32_groups'][i] for sd in all_state_dict]
+            flat_local_partition.append(self._get_flattened_partition(merged_partitions))
+
+        for current, saved in zip(self.fp32_partitioned_groups_flat, flat_local_partition):
+            current.data.copy_(saved.data)
+
+    # Restore base optimizer fp32 weights from ZeRO fp16 weights
+    def _restore_from_fp16_weights(self):
+        for fp16_partitions, fp32_partition in zip(self.fp16_partitioned_groups_flat, self.fp32_partitioned_groups_flat):
+            fp32_partition.data.copy_(fp16_partitions.data)
+
+    # Refresh the fp32 master params from the fp16 copies.
+    def refresh_fp32_params(self):
+        self._restore_from_fp16_weights()
+
+    # Extract flattened partion for current rank from all partitions
+    def _get_flattened_partition(self, all_partition_states):
+        partition_id = dist.get_rank(group=self.dp_process_group)
+        alignment = dist.get_world_size(group=self.dp_process_group)
+
+        param_partitions = [[] for _ in range(len(all_partition_states[0]))]
+        for i, partition in enumerate(all_partition_states):
+            for j, param in enumerate(partition):
+                param_partitions[j].append(param)
+
+        local_state_partitions = []
+        for param_index, param_slices in enumerate(param_partitions):
+            flattened_merged_tensor = self.flatten_dense_tensors_aligned(
+                param_slices,
+                alignment)
+            new_partitions = self.get_data_parallel_partitions(flattened_merged_tensor)
+            local_state_partitions.append(new_partitions[partition_id])
+
+        if torch.is_tensor(local_state_partitions[0]):
+            return self.flatten_dense_tensors_aligned(local_state_partitions, alignment)
+
+        # Assume non-tensor states are not partitioned and equal across ranks, so return first one
+        return local_state_partitions[0]
+
+    # Restore base optimizer state from checkpoint by
+    # 1) Merging optimizer state from checkpoints of all partitions
+    # 2) Extracting optimizer state for current partition from the merged state
+    # 3) Using the extracted value to directly update the base optimizer.
+    def _restore_base_optimizer_state(self, all_state_dict):
+        base_optimizer_group_states = []
+        for i in range(len(self.optimizer.param_groups)):
+            partition_states = {}
+            all_partition_group_states = [
+                sd['base_optimizer_state'][i] for sd in all_state_dict
+            ]
+            for key in all_partition_group_states[0].keys():
+                all_partition_states = [
+                    all_states[key] for all_states in all_partition_group_states
+                ]
+                partition_states[key] = self._get_flattened_partition(
+                    all_partition_states)
+            base_optimizer_group_states.append(partition_states)
+
+        for i, group in enumerate(self.optimizer.param_groups):
+            p = group['params'][0]
+            for key, saved in base_optimizer_group_states[i].items():
+                if torch.is_tensor(self.optimizer.state[p][key]):
+                    self.optimizer.state[p][key].data.copy_(saved.data)
+                else:
+                    self.optimizer.state[p][key] = saved
+
     def _rigid_load_state_dict(self, state_dict, load_optimizer_states=True):
         # I think it should actually be ok to reload the optimizer before the model.
         self.loss_scaler = state_dict['loss_scaler']
@@ -2358,7 +2629,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 partitioned_param.data = q.data
 
     # TODO: Support different/changing load/save DP degree.
-    def load_state_dict(self, state_dict_list, load_optimizer_states=True):
+    def load_state_dict(self,
+                        state_dict_list,
+                        load_optimizer_states=True,
+                        load_from_fp32_weights=False):
         r"""Loading a ZeRO checkpoint
         Arguments:
             state_dict_list: List of all saved ZeRO checkpoints, one for each saved partition.
@@ -2408,6 +2682,20 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     def save_checkpoint_epilogue(self):
         if len(self.persistent_parameters) > 0:
             self.persistent_parameters[0].all_gather(self.persistent_parameters)
+
+
+def _handle_overflow(cpu_sum, x, i):
+    import math
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        t_i = -1
+        for v_i, v in enumerate(x.data.contiguous().view(-1)):
+            if not math.isfinite(float(v)):
+                t_i = v_i
+                break
+        logger.info(
+            f"rank {rank} detected overflow {cpu_sum} in tensor {i}:{t_i} shape {x.shape}"
+        )
 
 
 def estimate_zero3_model_states_mem_needs(total_params,
