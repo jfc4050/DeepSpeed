@@ -1294,9 +1294,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                           _run_after_backward_function,
                                           inputs)
 
+        # Pre forward hook
         module.register_forward_pre_hook(_pre_forward_module_hook)
+        # Post forward hook
         module.register_forward_hook(_post_forward_module_hook)
+
+        # Pre backward hook
         module.register_forward_hook(_pre_backward_module_hook)
+
+        # post backward hook
         module.register_forward_pre_hook(_post_backward_module_hook)
 
     @instrument_w_nvtx
