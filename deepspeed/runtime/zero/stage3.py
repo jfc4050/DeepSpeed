@@ -42,8 +42,14 @@ FWD_MODULE_STACK = list()
 
 
 def print_rank_0(message, debug=False, force=False):
-    if torch.distributed.get_rank() == 0 and (debug or force):
-        logger.info(message)
+    rank = torch.distributed.get_rank()
+    if rank == 0 and (debug or force):
+        print(message)
+    # other variations
+    # - print for all ranks w/o interleaving
+    # printflock(f"[{rank}] {message}")
+    # - print to log file per rank
+    # log_rank_file(rank, message)
 
 
 def debug_rank0(message: str) -> None:
