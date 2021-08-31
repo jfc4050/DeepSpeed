@@ -550,6 +550,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         if dist.get_rank() == 0:
             logger.info(f"initialized {__class__.__name__} with args: {locals()}")
+            logger.info(f"Reduce bucket size {reduce_bucket_size}")
+            logger.info(f"Allgather bucket size {prefetch_bucket_size}")
         # The fused optimizer does all the work. We need this layer for two reason:
         # 1. maintain same user API from apex.fp16_utils
         # 2. keep common stuff here in case we need to add ne552w fused optimizer later
@@ -561,7 +563,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # - master gard and unflat master weight never exist. TODO: a way to save out unflat master?
         if not torch.cuda.is_available:
             raise SystemError("Cannot use fp16 without CUDA.")
-        self.optimizer: Optimizer = init_optimizer
+        self.optimizer = init_optimizer
 
         # Load pre-built or JIT compile (un)flatten ops
         util_ops = UtilsBuilder().load()
