@@ -780,7 +780,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.averaged_gradients: Dict[int, List[Tensor]] = {}
 
         #creates backward hooks for gradient partitioning
-        self.__init_reduce_and_remove_grad_hooks()
+        self.create_reduce_and_remove_grad_hooks()
 
         # we may have a way of fusing dynamic scale. Do not support for now
         if self.dtype == torch.float or not dynamic_loss_scale:
@@ -1600,7 +1600,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         torch.cuda.synchronize()
 
-    def __init_reduce_and_remove_grad_hooks(self):
+    def create_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
         self.grad_accs = []
         for i, param_group in enumerate(self.fp16_groups):
