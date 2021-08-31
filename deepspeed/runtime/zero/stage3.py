@@ -1717,6 +1717,69 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return grad_partitions_for_rank
 
+    def set_grad_positions(self):
+        for i, group in enumerate(self.fp16_groups):
+            current_offset = 0
+            for param in group:
+                param_id = self.get_param_id(param)
+                num_elements = param.ds_tensor.ds_numel
+
+                self.grad_position[param_id] = [
+                    int(i),
+                    int(current_offset),
+                    int(num_elements)
+                ]
+                #print(f"param id {param_id} i:{i}, ds_tensor {num_elements} numel {param.numel()}")
+                current_offset += num_elements
+
+    def async_accumulate_grad_in_cpu_via_gpu(self, param, acc_grad_cpu_partition):
+
+        # copy to a preexisiting buffer to avoid memory allocation penalty
+        dest_buffer = self.temp_grad_buffer_for_gpu_offload.view(-1).narrow(
+            0,
+            0,
+            param.ds_tensor.ds_numel)
+
+        if self.micro_step_id > 0:
+            dest_buffer.copy_(acc_grad_cpu_partition.view(-1), non_blocking=True)
+            param.grad.data.view(-1).add_(dest_buffer)
+
+        # at the boundary we will send 32bit directly
+        if not self.is_gradient_accumulation_boundary:
+            acc_grad_cpu_partition.data.copy_(param.grad.data.view(-1),
+                                              non_blocking=True)
+
+    def _constant_buffered_norm2(self, input, buffer_size=250000000):
+        norm = None
+        for part in input.view(-1).split(buffer_size):
+            if norm is None:
+                norm = part.data.double().norm(2)**2.0
+            else:
+                norm += part.data.double().norm(2)**2.0
+        return norm**0.5
+
+    def set_norm_for_param_grad_in_gpu(self, param):
+        param_id = self.get_param_id(param)
+        #self.norm_for_param_grads[param_id] = param.grad.data.double().norm(2)
+        #Using a more memory efficient version
+        self.norm_for_param_grads[param_id] = self._constant_buffered_norm2(param.grad)
+
+    def update_overflow_tracker_for_param_grad(self, param):
+        #Credit to our user David Minn
+        if param.grad is not None:
+            if self.overlap_comm:
+                self.gpu_sum = self.gpu_sum + param.grad.data.float().sum()
+            elif self._has_inf_or_nan(param.grad.data):
+                self.local_overflow = True
+
+    def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param, fp32_grad_tensor):
+        with torch.cuda.stream(self.copy_grad_stream):
+            param_id = self.get_param_id(param)
+            src_tensor = param.grad.view(-1).float()
+            #print(f"src_tensor {src_tensor.size()} and fp32 grad {fp32_grad_tensor.size()}")
+            fp32_grad_tensor.copy_(src_tensor, non_blocking=True)
+            param.grad = None
+
     def complete_grad_norm_calculation_for_cpu_offload(self, params):
         total_norm = 0.0
         norm_type = 2.0
