@@ -1683,6 +1683,40 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     #########################ZeRO Partition Gradients########################
     #########################################################################
 
+    def get_first_param_index(self, group_id, param_group, partition_id):
+        for index, param in enumerate(param_group):
+            param_id = self.get_param_id(param)
+            if partition_id in self.param_to_partition_ids[group_id][param_id]:
+                return index
+        return None
+
+    def initialize_gradient_partitioning_data_structures(self):
+
+        total_partitions = dist.get_world_size(group=self.dp_process_group)
+
+        for i, param_group in enumerate(self.fp16_groups):
+
+            self.param_to_partition_ids[i] = {}
+            self.is_partition_reduced[i] = {}
+            self.total_grads_in_partition[i] = {}
+            self.remaining_grads_in_partition[i] = {}
+            self.is_grad_computed[i] = {}
+            self.grad_partition_insertion_offset[i] = {}
+            self.grad_start_offset[i] = {}
+            self.first_param_index_in_partition[i] = {}
+
+            for partition_id in range(total_partitions):
+                self.is_grad_computed[i][partition_id] = {}
+                self.grad_partition_insertion_offset[i][partition_id] = {}
+                self.grad_start_offset[i][partition_id] = {}
+                self.initialize_gradient_partition(i, param_group, partition_id)
+                self.is_partition_reduced[i][partition_id] = False
+                self.first_param_index_in_partition[i][
+                    partition_id] = self.get_first_param_index(
+                        i,
+                        param_group,
+                        partition_id)
+
     @instrument_w_nvtx
     def independent_gradient_partition_epilogue(self):
         torch.cuda.synchronize()
