@@ -1696,11 +1696,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            if self.__params_in_ipg_bucket and self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
-                            ):
-                                self.__reduce_and_partition_ipg_grads()
-
-                            self.__add_grad_to_ipg_bucket(param)
+                            self.reduce_ready_partitions_and_remove_grads(param, i)
 
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
@@ -1724,6 +1720,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             force=False)
 
     ###############Idependent Partition Gradient ########################
+    def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
+        if self.__params_in_ipg_bucket and self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
+        ):
+            self.__reduce_and_partition_ipg_grads()
+
+        self.__add_grad_to_ipg_bucket(param)
+
     @instrument_w_nvtx
     @torch.no_grad()
     def __add_grad_to_ipg_bucket(self, param: Parameter) -> None:
@@ -1953,6 +1956,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     parameter=self.fp32_partitioned_groups_flat[i],
                     gradient_offsets=offload_fp32_offsets[i],
                     gradient_tensors=offload_fp32_gradients[i])
+
+    def reduce_ready_partitions_and_remove_grads(self, param, i):
+        #print_rank_0(f"Backward {debug_param2name_id_shape(param)}", force=True)
+        self.reduce_independent_p_g_buckets_and_remove_grads(param, i)
 
     def zero_reduced_gradients(self, partition_id, i):
         def are_all_related_partitions_reduced(params_id):
