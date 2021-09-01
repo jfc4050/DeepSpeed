@@ -798,7 +798,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.extra_large_param_to_reduce = None
         self.grads_in_ipg_bucket = []
         self.params_in_ipg_bucket = []
-        self.elements_in_ipg_bucket = 0
         self.params_already_reduced = []
         self.is_gradient_accumulation_boundary = True
         self._release_ipg_buffers()
@@ -902,7 +901,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             timers=self.timers)
 
     @property
-    def __elements_in_ipg_bucket(self):
+    def elements_in_ipg_bucket(self):
         return sum(p.ds_numel for p in self.__params_in_ipg_bucket)
 
     def _create_fp16_partitions(self):
@@ -1740,7 +1739,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
         # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
         # empty, while reduction_list will have that garbage data.
-        if self.elements_in_ipg_bucket > 0 and self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
+        if self.elements_in_ipg_bucket > 0 and self.elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
         ):
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
@@ -1769,7 +1768,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             # move the parameter's gradient to the contiguous flat buffer
             new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
                 0,
-                self.__elements_in_ipg_bucket,
+                self.elements_in_ipg_bucket,
                 param.ds_numel).view_as(param.grad)
             new_grad_tensor.copy_(param.grad)
             param.grad.record_stream(torch.cuda.current_stream())
