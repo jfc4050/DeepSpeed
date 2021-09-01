@@ -623,6 +623,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.offload_optimizer_pin_memory = False
         self.offload_optimizer_fast_init = False
         if offload_optimizer_config is not None:
+            if not self.contiguous_gradients:
+                raise ValueError(
+                    "optimizer offload only available with contiguous gradients enabled")
             self.offload_optimizer = True
             self.offload_optimizer_pin_memory = offload_optimizer_config[
                 OFFLOAD_OPTIMIZER_PIN_MEMORY]
@@ -770,10 +773,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.reduce_bucket_size = int(reduce_bucket_size)
 
         # IPG
-        self.__ipg_bucket_flat_buffer: Tensor = torch.empty(
-            int(reduce_bucket_size),
-            dtype=self.dtype,
-            device=torch.cuda.current_device())
+        if contiguous_gradients:
+            self.__ipg_bucket_flat_buffer: Tensor = torch.empty(
+                int(reduce_bucket_size),
+                dtype=self.dtype,
+                device=torch.cuda.current_device())
 
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
 
@@ -1812,24 +1816,27 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     @torch.no_grad()
     def __add_grad_to_ipg_bucket(self, param: Parameter) -> None:
-        if param.ds_numel > self.__ipg_bucket_flat_buffer.numel():
+        if self.contiguous_gradients and (param.ds_numel > self.reduce_bucket_size):
             raise NotImplementedError(
-                f"param ds_numel {param.ds_numel} too large for fixed buffer of size {self.__ipg_bucket_flat_buffer.numel()}. "
+                f"param ds_numel {param.ds_numel} too large for fixed buffer of size {self.reduce_bucket_size}. "
                 f"in the future it is possible to just dynamically allocate and reduce but for now "
                 f"please increase size of reduce bucket")
 
-        with torch.cuda.stream(self.__reduce_and_partition_stream):
-            torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
-            # move the parameter's gradient to the contiguous flat buffer
-            new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
-                0,
-                self.elements_in_ipg_bucket,
-                param.ds_numel).view_as(param.grad)
-            new_grad_tensor.copy_(param.grad)
-            param.grad.record_stream(torch.cuda.current_stream())
-            param.grad.data = new_grad_tensor
+        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
 
-            self.__params_in_ipg_bucket.append(param)
+        if self.contiguous_gradients:
+            # move the gradient to a contiguous buffer
+            with torch.cuda.stream(self.__reduce_and_partition_stream):
+                # move the parameter's gradient to the contiguous flat buffer
+                new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
+                    0,
+                    self.elements_in_ipg_bucket,
+                    param.ds_numel).view_as(param.grad)
+                new_grad_tensor.copy_(param.grad)
+                param.grad.record_stream(torch.cuda.current_stream())
+                param.grad.data = new_grad_tensor
+
+        self.__params_in_ipg_bucket.append(param)
 
     @instrument_w_nvtx
     @torch.no_grad()

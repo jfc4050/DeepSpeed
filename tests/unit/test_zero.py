@@ -347,16 +347,21 @@ class EltwiseMultiplicationTestNetwork(Module):
 
 @pytest.mark.parametrize("param_persistence_threshold", [0, 10])
 @pytest.mark.parametrize("fp16_enabled", [True, False])
+@pytest.mark.parametrize("contiguous_gradients", [False])
 @pytest.mark.parametrize("offload_optimizer", [True, False])
 @pytest.mark.parametrize("iteration", list(range(1)))
 def test_zero3_param_partitioning_base(
         param_persistence_threshold: int,
         fp16_enabled: bool,
+        contiguous_gradients: bool,
         offload_optimizer: bool,
         iteration: int,
 ) -> None:
     @distributed_test(world_size=[2])
     def _test_zero3_param_partitioning():
+        if offload_optimizer and not contiguous_gradients:
+            return
+
         m = 3
         n = 5
         weights = [Parameter(torch.zeros((m, n), dtype=torch.float32)) for _ in range(3)]
@@ -368,6 +373,7 @@ def test_zero3_param_partitioning_base(
                 "stage": 3,
                 "stage3_max_reuse_distance": 0,
                 "stage3_param_persistence_threshold": param_persistence_threshold,
+                "contiguous_gradients": contiguous_gradients,
             },
             "optimizer": {
                 "type": "Adam",
