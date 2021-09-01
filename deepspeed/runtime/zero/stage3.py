@@ -1716,6 +1716,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         unique_id = id(param)
         return self.param_id[unique_id]
 
+    def report_ipg_memory_usage(self, tag, param_elems):
+        elem_count = self.elements_in_ipg_bucket + param_elems
+        percent_of_bucket_size = (100.0 * elem_count) // self.reduce_bucket_size
+        see_memory_usage(
+            f"{tag}: elems in_bucket {self.elements_in_ipg_bucket} param {param_elems} max_percent {percent_of_bucket_size}",
+            force=False)
+
     ###############Idependent Partition Gradient ########################
     @instrument_w_nvtx
     @torch.no_grad()
