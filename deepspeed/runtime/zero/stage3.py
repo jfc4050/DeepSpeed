@@ -52,6 +52,33 @@ def print_rank_0(message, debug=False, force=False):
     # log_rank_file(rank, message)
 
 
+def input(msg):
+    return
+
+
+def split_half_float_double(tensors):
+    dtypes = [
+        "torch.cuda.HalfTensor",
+        "torch.cuda.FloatTensor",
+        "torch.cuda.DoubleTensor"
+    ]
+    buckets = []
+    for i, dtype in enumerate(dtypes):
+        bucket = [t for t in tensors if t.type() == dtype]
+        if bucket:
+            buckets.append(bucket)
+    return buckets
+
+
+def isclose(a, b, rtol=1e-09, atol=0.0):
+    return abs(a - b) <= max(rtol * max(abs(a), abs(b)), atol)
+
+
+def lcm(x, y):
+    from fractions import gcd  # or can import gcd from `math` in Python 3
+    return x * y // gcd(x, y)
+
+
 def debug_rank0(message: str) -> None:
     if dist.get_rank() == 0:
         logger.debug(message)
@@ -63,10 +90,6 @@ def get_cuda_mem_allocated_str() -> str:
     # for memory debugging.
     # return f"{torch.cuda.memory_allocated() / 1024 ** 3:.2f}GB"
     return "xGB"
-
-
-def input(msg):
-    return
 
 
 def move_to_cpu(tensor_list):
