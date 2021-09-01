@@ -666,6 +666,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.dp_process_group = dp_process_group
 
+        self.partition_count = dist.get_world_size(group=self.dp_process_group)
+
         if mpu is None:
             self.model_parallel_group = None
             self.model_parallel_rank = 0
@@ -2792,7 +2794,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         state_dict['loss_scaler'] = self.loss_scaler
         state_dict['dynamic_loss_scale'] = self.dynamic_loss_scale
         state_dict['overflow'] = self.overflow
-        state_dict['partition_count'] = dist.get_world_size(group=self.dp_process_group)
+        state_dict['partition_count'] = self.partition_count
 
         self._set_fp32_optimizer_param_groups()
         state_dict['optimizer_state_dict'] = self.optimizer.state_dict()
