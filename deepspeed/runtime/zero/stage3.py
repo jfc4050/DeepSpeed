@@ -1528,6 +1528,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} after release",
             force=False)
 
+    def _release_ipg_buffers(self):
+        if self.contiguous_gradients:
+            self.ipg_buffer = None
+            if not self.offload_optimizer and self.is_gradient_accumulation_boundary:
+                self.grads_in_partition = None
+
+            self.grads_in_partition_offset = 0
+
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
