@@ -631,7 +631,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.device = torch.cuda.current_device(
         ) if not self.offload_optimizer else OFFLOAD_CPU_DEVICE
-
         ### streams used for overlapping computation with communication
         self.__allgather_stream = Stream(
         ) if overlap_comm else torch.cuda.default_stream()
@@ -639,6 +638,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         ) if overlap_comm else torch.cuda.default_stream()
 
         ############################################################################
+
+        see_memory_usage("Before Partitioned Parameter Coordinator", force=False)
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=int(prefetch_bucket_size),
             max_reuse_distance_in_numel=int(max_reuse_distance),
@@ -646,7 +647,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             allgather_stream=self.__allgather_stream,
             prefetch_nvme=self.params_in_nvme_and_cpu,
         )
+        see_memory_usage("After Partitioned Parameter Coordinator", force=False)
 
+        #self.param_coordinator = PartitionedParameterCoordinator(comm_stream=torch.cuda.Stream())
         #-------------Stage 3 Setup-------------------#
         # parameters smaller than the threshold will be collectively gathered at the
         # end of the optimizer step and will be kept till the end of the backward pass
@@ -739,6 +742,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
 
+        if dist.get_rank() == 0:
+            logger.info(f"optimizer state initialized")
+
+        self.reduce_bucket_size = int(reduce_bucket_size)
+
         # IPG
         self.__ipg_bucket_flat_buffer: Tensor = torch.empty(
             int(reduce_bucket_size),
@@ -793,6 +801,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.elements_in_ipg_bucket = 0
         self.params_already_reduced = []
         self.is_gradient_accumulation_boundary = True
+        self._release_ipg_buffers()
         self.previous_reduced_grads = None
 
         # simplified param id
@@ -1343,6 +1352,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         #reset step if in inference mode
         @instrument_w_nvtx
         def _end_of_forward_hook(module, *args):
+
             if not torch._C.is_grad_enabled():
                 self.param_coordinator.reset_step()
 
@@ -1497,8 +1507,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         if not self.param_coordinator.trace_complete:
             self.param_coordinator.record_trace(sub_module)
-        self.param_coordinator.fetch_sub_module(sub_module)
 
+        self.param_coordinator.fetch_sub_module(sub_module)
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
@@ -1654,7 +1664,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def independent_gradient_partition_epilogue(self):
         torch.cuda.synchronize()
+        self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         self.__reduce_and_partition_ipg_grads()
+        self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
         torch.cuda.synchronize()
 
@@ -1721,9 +1733,25 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     ###############Idependent Partition Gradient ########################
     def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
-        if self.__params_in_ipg_bucket and self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
+        #print_rank_0(f"Inside reduce ipg buckets. {debug_param2name_id_shape(param)}, ipg elements {self.elements_in_ipg_bucket}, reduce bucket size {self.reduce_bucket_size}", force=True)
+
+        # Because the ipg bucket is initialized with a random place holder tensor, we must
+        # explicitly check that the bucket has any real data in it (self.elements_in_ipg_bucket >
+        # 0). Otherwise if the incoming param.ds_numel is large, this branch may get triggered on a
+        # garbage data and `self.average_tensor()` will crash because its params_to_reduce will be
+        # empty, while reduction_list will have that garbage data.
+        if self.elements_in_ipg_bucket > 0 and self.__elements_in_ipg_bucket + param.ds_numel > self.__ipg_bucket_flat_buffer.numel(
         ):
+            self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
+                                         param.ds_numel)
+
             self.__reduce_and_partition_ipg_grads()
+
+        param_id = self.get_param_id(param)
+        assert self.params_already_reduced[param_id] == False, \
+            f"The parameter {param_id} has already been reduced. \
+            Gradient computed twice for this partition. \
+            Multiple gradient reduction is currently not supported"
 
         self.__add_grad_to_ipg_bucket(param)
 
@@ -2180,11 +2208,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                          group=self.model_parallel_group)
 
     @instrument_w_nvtx
-    def get_grad_norm_direct(self,
-                             gradients: Iterable[Tensor],
-                             params: Iterable[Parameter],
-                             norm_type: Union[int,
-                                              float] = 2) -> float:
+    def get_grad_norm_direct(self, gradients, params, norm_type=2):
         """Clips gradient norm of an iterable of parameters.
 
         This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -2495,6 +2519,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return self.overflow
 
     def _post_step(self, timer_names=set()):
+        if self.offload_optimizer:
+            self.reset_cpu_buffers()
+
         #Gathering persisting parameters
         if len(self.persistent_parameters) > 0:
             self.persistent_parameters[0].all_gather(self.persistent_parameters)
@@ -2719,7 +2746,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def _partition_all_parameters(self):
         for name, param in self.module.named_parameters(recurse=True):
-            # assert not param.ds_active_sub_modules, param.ds_summary()
             self.param_coordinator.release_and_reset_parameter(param)
 
     def check_overflow(self, partition_gradients=True):
