@@ -1652,7 +1652,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     #########################################################################
 
     @instrument_w_nvtx
-    def overlapping_partition_gradients_reduce_epilogue(self):
+    def independent_gradient_partition_epilogue(self):
         torch.cuda.synchronize()
         self.__reduce_and_partition_ipg_grads()
 
@@ -1672,11 +1672,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         self.averaged_gradients[i].append(
                             torch.zeros_like(param.ds_tensor))
 
-            torch.cuda.synchronize()
-
-            self.zero_grad()
-
         torch.cuda.synchronize()
+
+    def overlapping_partition_gradients_reduce_epilogue(self):
+        self.independent_gradient_partition_epilogue()
+        self.zero_grad()
 
     def create_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')
