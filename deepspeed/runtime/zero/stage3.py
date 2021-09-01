@@ -842,10 +842,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.is_grad_computed = {}
 
         # will store the averaged gradients required by this parititon
-        self.averaged_gradients: Dict[int, List[Tensor]] = {}
+        self.averaged_gradients = {}
 
         #creates backward hooks for gradient partitioning
         self.create_reduce_and_remove_grad_hooks()
+
+        #exit(0)
 
         # we may have a way of fusing dynamic scale. Do not support for now
         if self.dtype == torch.float or not dynamic_loss_scale:
@@ -853,6 +855,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             self.dynamic_loss_scale = False
             self.loss_scaler = LossScaler(scale=loss_scale_value)
+            cur_iter = 0
         else:
             if dynamic_loss_args is None:
                 self.loss_scaler = DynamicLossScaler()
