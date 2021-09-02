@@ -397,15 +397,21 @@ class PartitionedParameterCoordinator:
 
     @instrument_w_nvtx
     @torch.no_grad()
-    def release_and_reset_parameter(self, param: Parameter) -> None:
-        """release a parameter, assuming it meets conditions to be released."""
-        if param in self.__inflight_param_registry:
-            raise RuntimeError(f"param {param.ds_summary()} still in flight")
+    def release_and_reset_all(self) -> None:
+        """release all module parameters"""
+        for param in map(lambda p: p.param, self.__param_order):
+            if param in self.__inflight_param_registry:
+                raise RuntimeError(f"param {param.ds_summary()} still in flight")
 
-        # TODO. make this throw if if there are still active submodules. currently
-        # there's a hook execution issue
-        param.ds_active_sub_modules.clear()
-        self.__release_param(param)
+            # TODO. make this throw if if there are still active submodules. currently
+            # there's a hook execution issue
+            param.ds_active_sub_modules.clear()
+            self.__release_param(param)
+
+        for param_in_trace in self.__param_order:
+            if param_in_trace.param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
+                raise RuntimeError(
+                    f"{param_in_trace.param.ds_summary()} expected to be released")
 
     @instrument_w_nvtx
     def __all_gather_params(self, params: Set[Parameter]) -> None:
@@ -2824,8 +2830,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def _partition_all_parameters(self):
-        for name, param in self.module.named_parameters(recurse=True):
-            self.param_coordinator.release_and_reset_parameter(param)
+        self.param_coordinator.release_and_reset_all()
+        for param in iter_params(self.module, recurse=True):
+            if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
+                raise RuntimeError(f"{param.ds_summary()} expected to be released")
 
     def check_overflow(self, partition_gradients=True):
         self._check_overflow(partition_gradients)
