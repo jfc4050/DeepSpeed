@@ -2604,6 +2604,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         return self.overflow
 
+    @instrument_w_nvtx
     def _post_step(self, timer_names=set()):
         if self.offload_optimizer:
             self.reset_cpu_buffers()
