@@ -1770,6 +1770,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 #     self.fp32_partitioned_groups_flat[i].numel(),
                 #     return_tensor_list=True)
 
+            torch.cuda.synchronize()
+
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.independent_gradient_partition_epilogue()
         self.zero_grad()
