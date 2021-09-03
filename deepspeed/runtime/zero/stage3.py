@@ -633,7 +633,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.offload_optimizer_pin_memory = False
         self.offload_optimizer_fast_init = False
         if offload_optimizer_config is not None:
-            if not self.contiguous_gradients:
+            if not contiguous_gradients:
                 raise ValueError(
                     "optimizer offload only available with contiguous gradients enabled")
             self.offload_optimizer = True
