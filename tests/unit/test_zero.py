@@ -527,6 +527,7 @@ def test_zero3_param_partitioning_base(
         # TODO. add testing for this - for now we just call it to make sure it
         # doesnt throw
         ds_engine.optimizer.step()
+        assert avgd_gradients[0] == None, avgd_gradients
 
     _test_zero3_param_partitioning()
 
