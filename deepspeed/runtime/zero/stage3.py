@@ -1767,8 +1767,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 #     self.fp32_partitioned_groups_flat[i].numel(),
                 #     return_tensor_list=True)
 
-            torch.cuda.synchronize()
-
         # this method gets called after every backward. need to increment
         # here because if it gets incremented in backward() the micro step
         # id will be off by one when we do the reduce and partition at the.
