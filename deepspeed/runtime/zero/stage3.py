@@ -1769,6 +1769,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             torch.cuda.synchronize()
 
+        # this method gets called after every backward. need to increment
+        # here because if it gets incremented in backward() the micro step
+        # id will be off by one when we do the reduce and partition at the.
+        # start of this method.
+        # TODO. make this less error prone
+        self.micro_step_id += 1
+
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.independent_gradient_partition_epilogue()
         self.zero_grad()
@@ -2841,8 +2848,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         2. scaled_loss = fp32_loss*loss_scale
         3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
         """
-        self.micro_step_id += 1
-
         if self.swap_optimizer:
             self.optimizer_swapper.pre_backward()
 
