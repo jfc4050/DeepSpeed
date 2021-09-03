@@ -3,7 +3,6 @@
 Licensed under the MIT license.
 """
 
-from deepspeed.runtime.zero.utils import assert_ints_same_as_other_ranks
 import os
 import time
 import types
@@ -15,7 +14,6 @@ from typing import List
 
 import torch
 from torch import Tensor
-from torch.cuda import Stream
 import torch.distributed
 from torch.distributed.distributed_c10d import _get_global_rank
 from torch.nn import Parameter
@@ -24,7 +22,8 @@ from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
 
 from ..utils import get_only_unique_item, see_memory_usage
-from deepspeed.utils import log_dist, init_distributed, instrument_w_nvtx
+from deepspeed.runtime.zero.utils import assert_ints_same_as_other_ranks
+from deepspeed.utils import init_distributed, instrument_w_nvtx
 from deepspeed.utils.debug import debug_param2name_id_shape, debug_param2name_id_shape_device, debug_module2name, debug_param2name, debug_param2name_id_shape_status, printflock, log_rank_file
 from deepspeed.utils.logging import logger
 
@@ -711,7 +710,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param_list = [cls]
             self._partition(param_list, has_been_updated=has_been_updated)
 
-        @instrument_w_nvtx
         def reduce_gradients_at_owner(param_list=None, hierarchy=0):
             cls = param
             if param_list is None:
@@ -719,10 +717,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             print_rank_0(
                 f"{'--'*hierarchy}----Reducing Gradients for param with ids {[param.ds_id for param in param_list]} to owner"
             )
-            for p in param_list:
-                self._reduce_scatter_gradient(p)
+            self._reduce_scatter_gradients(param_list)
 
-        @instrument_w_nvtx
         def partition_gradients(param_list=None,
                                 partition_buffers=None,
                                 hierarchy=0,
@@ -736,13 +732,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 if isinstance(partition_buffers, torch.Tensor):
                     partition_buffers = [partition_buffers]
 
-            if partition_buffers is None:
-                partition_buffers = [None] * len(param_list)
-
-            for p, partition_buffer in zip(param_list, partition_buffers):
-                self._partition_gradient(p,
-                                         partition_buffer=partition_buffer,
-                                         accumulate=accumulate)
+            self._partition_gradients(param_list,
+                                      partition_buffers=partition_buffers,
+                                      accumulate=accumulate)
 
         def aligned_size():
             return self._aligned_size(param)
@@ -839,6 +831,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #print_rank_0(f"Before Partitioning Param {param.ds_id}")
             #self._param_status(param)
             self._partition_param(param, has_been_updated=has_been_updated)
+            param.ds_status = ZeroParamStatus.NOT_AVAILABLE
             #if param.ds_tensor is not None:
             #    assert id(param.data) == id(param.ds_tensor.data), \
             #    "After the parameters are initially partitioned, make sure we are not recreating the partition."
@@ -867,10 +860,16 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #if torch.distributed.get_rank():
             #    print(f"Releasing {param.data.numel()}")
             if param.ds_tensor is not None and not has_been_updated:
+
                 #param.data = param.ds_tensor.data
-                see_memory_usage(f"before partitioning {param.ds_summary()}")
+
+                see_memory_usage(
+                    f'Before partitioning param {param.ds_id} {param.shape}',
+                    force=False)
+                #param.data does not store anything meaningful in partitioned state
                 free_param(param)
-                see_memory_usage(f"after partitioning {param.ds_summary()}")
+                see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
+                                 force=False)
 
                 if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
                     print_rank_0(
@@ -975,7 +974,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 f"Param id {param.ds_id}, param status: {param.ds_status}, param numel {param.ds_numel}, partitioned ds_tensor {param.ds_tensor}, data numel {param.data.numel()}"
             )
 
-    @instrument_w_nvtx
     def _allgather_param(self, param, async_op=False, hierarchy=0):
 
         partition_size = param.ds_tensor.ds_numel
@@ -1087,26 +1085,58 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         return None
 
-    @instrument_w_nvtx
-    def _reduce_scatter_gradient(self, param: Parameter) -> None:
-        if param.grad.numel() != param.ds_numel:
-            raise RuntimeError(
-                f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter "
-                f"gradients whose size is not same as the params")
+    def _reduce_scatter_gradients(self, param_list):
+        #print_rank_0([param.grad for param in param_list])
+        #assert any([param.grad is None for param in param_list]), "None gradients cannot be reduce scattered"
+
+        handles_and_reduced_partitions = []
+        for param in param_list:
+            assert param.grad.numel(
+            ) == param.ds_numel, f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter gradients whose size is not same as the params"
+
+            handles_and_reduced_partitions.append(self._reduce_scatter_gradient(param))
+
+        for param, (handle, reduced_partition) in zip(param_list, handles_and_reduced_partitions):
+            if handle is not None:
+                handle.wait()
+
+            # some ranks may have partitions that are padded to go beyond the grad size.
+            # For these ranks the output of reduce scatter is a separate buffer and needs
+            # to be copied in
+            partition_size = param.ds_tensor.ds_numel
+            start = self.rank * partition_size
+            end = start + partition_size
+            #print_rank_0("REduce scatter was executed for praam {param.ds_id}")
+            if start < param.ds_numel and end > param.ds_numel:
+                elements = param.ds_numel - start
+                param.grad.view(-1).narrow(0,
+                                           start,
+                                           elements).copy_(
+                                               reduced_partition.narrow(0,
+                                                                        0,
+                                                                        elements))
+
+    def _reduce_scatter_gradient(self, param):
 
         partition_size = param.ds_tensor.ds_numel
+        #output = torch.empty(partition_size, dtype=param.dtype, device=param.device)
 
-        input_list: List[Tensor] = []
+        total_size = partition_size * self.world_size
+        input_list = []
+
         for i in range(self.world_size):
+
             start = i * partition_size
             end = start + partition_size
 
+            #print("before reduce scatter gradients")
             if start < param.ds_numel and end <= param.ds_numel:
                 input = param.grad.view(-1).narrow(0, start, partition_size)
             else:
                 input = torch.zeros(partition_size,
                                     dtype=param.dtype,
                                     device=param.device)
+
                 if start < param.ds_numel:
                     elements = param.ds_numel - start
                     input.narrow(0,
@@ -1115,69 +1145,88 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                      param.grad.view(-1).narrow(0,
                                                                 start,
                                                                 elements))
+            #print("after reduce scatter gradients")
             input_list.append(input)
 
-        reduced_partition = input_list[self.rank]
-        instrument_w_nvtx(torch.distributed.reduce_scatter)(reduced_partition,
-                                                            input_list,
-                                                            group=self.ds_process_group)
+        rank = torch.distributed.get_rank(group=self.ds_process_group)
+        handle = torch.distributed.reduce_scatter(input_list[rank],
+                                                  input_list,
+                                                  group=self.ds_process_group,
+                                                  async_op=True)
 
-        # some ranks may have partitions that are padded to go beyond the grad size.
-        # For these ranks the output of reduce scatter is a separate buffer and needs
-        # to be copied in
-        start = self.rank * partition_size
-        end = start + partition_size
-        if start < param.ds_numel and end > param.ds_numel:
-            elements = param.ds_numel - start
-            param.grad.view(-1).narrow(0,
-                                       start,
-                                       elements).copy_(
-                                           reduced_partition.narrow(0,
-                                                                    0,
-                                                                    elements))
+        return handle, input_list[rank]
 
-    @instrument_w_nvtx
-    def _partition_gradient(self,
-                            param: Parameter,
-                            partition_buffer: Tensor = None,
-                            accumulate: bool = False) -> None:
+    def _partition_gradients(self, param_list, partition_buffers=None, accumulate=False):
+        if partition_buffers is None:
+            partition_buffers = [None] * len(param_list)
+
+        for param, partition_buffer in zip(param_list, partition_buffers):
+            self._partition_gradient(param,
+                                     partition_buffer=partition_buffer,
+                                     accumulate=accumulate)
+
+    def _partition_gradient(self, param, partition_buffer=None, accumulate=False):
+        #import pdb;pdb.set_trace()
+        # param.grad=None
+        # param.grad.test()
         print_rank_0(
             f"Partitioning param {param.ds_id} gradient of size {param.grad.numel()} type {param.grad.dtype} part_size {param.ds_tensor.ds_numel}"
         )
         see_memory_usage("Before partitioning gradients", force=False)
+        partition_size = param.ds_tensor.ds_numel
 
-        if param.grad.numel() != param.ds_numel:
-            raise RuntimeError(
-                f"expected gradient to have {param.ds_numel} elements but got {param.grad.numel()}"
-            )
         if partition_buffer is None:
             assert not accumulate, "No buffer to accumulate to"
-            partition_buffer = torch.zeros(param.ds_tensor.ds_numel,
+            partition_buffer = torch.zeros(partition_size,
                                            dtype=param.dtype,
                                            device=param.device)
-        assert partition_buffer.shape == (param.ds_tensor.ds_numel, )
+        else:
+            assert partition_buffer.numel() >= partition_size, f"The partition buffer size {partition_buffer.numel()} should match the size of param.ds_tensor {partition_size}"
 
-        start = param.ds_tensor.ds_numel * torch.distributed.get_rank(
-            group=self.ds_process_group)
+        rank = torch.distributed.get_rank(group=self.ds_process_group)
+        start = partition_size * rank
+        end = start + partition_size
+
+        dest_tensor_full_buffer = partition_buffer.view(-1).narrow(0, 0, partition_size)
+
+        #print("before partition gradients")
         if start < param.ds_numel:
-            elements = min(param.ds_numel - start, param.ds_tensor.ds_numel)
+            elements = min(param.ds_numel - start, partition_size)
+
+            dest_tensor = dest_tensor_full_buffer.narrow(0, 0, elements)
             src_tensor = param.grad.view(-1).narrow(0, start, elements)
-            dst_tensor = partition_buffer.narrow(0, 0, elements)
+
+            # just copy the grad partition to the buffer
             if not accumulate:
-                dst_tensor.copy_(src_tensor)
-            elif src_tensor.device == dst_tensor.device:
-                dst_tensor.add_(src_tensor)
+                dest_tensor.copy_(src_tensor)
+
+            # if source and destinatoin are on same device,
+            # add to the provided buffer
+            elif src_tensor.device == dest_tensor.device:
+                dest_tensor.add_(src_tensor)
+
+            # if source and destination are on different device, copy first to src
+            # then add and move back to the destination. This seems to run faster
+            # when src is gpu and dest is cpu
+            # adding directly to cpu is very slow
             else:
-                # if source and destination are on different device, copy first to src
-                # then add and move back to the destination. This seems to run faster
-                # when src is gpu and dest is cpu. adding directly to cpu is very slow
-                tmp_dst_tensor = torch.empty_like(src_tensor)
-                tmp_dst_tensor.copy_(dst_tensor)
-                tmp_dst_tensor.add_(src_tensor)
-                dst_tensor.copy_(tmp_dst_tensor)
+                acc_tensor = torch.empty(src_tensor.numel(),
+                                         dtype=param.dtype,
+                                         device=param.device)
 
-        param.grad.data = partition_buffer.data
+                acc_tensor.copy_(dest_tensor)
+                acc_tensor.add_(src_tensor)
+                dest_tensor.copy_(acc_tensor)
 
+            # partition_buffer.view(-1).narrow(
+            #     0,
+            #     0,
+            #     elements).copy_(param.grad.view(-1).narrow(0,
+            #                                             start,
+            #                                             elements))
+
+        #print("after partition gradients")
+        param.grad.data = dest_tensor_full_buffer.data
         see_memory_usage("After partitioning gradients", force=False)
 
 
