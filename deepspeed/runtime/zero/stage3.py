@@ -539,9 +539,6 @@ class PostBackwardFunction(torch.autograd.Function):
         return (None, None) + args
 
 
-INITIAL_MICRO_STEP_ID = -1
-
-
 class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     """
     DeepSpeedZeroOptimizer designed to reduce the memory footprint
@@ -722,7 +719,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.gradient_predivide_factor = gradient_predivide_factor
         self.postscale_gradients = postscale_gradients
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.micro_step_id = INITIAL_MICRO_STEP_ID
+        self.micro_step_id = 0
 
         # Holds the mode parameter
         # The param.data may not hold any meaningful data
@@ -2450,7 +2447,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.timers(name).stop()
 
     def _pre_step(self):
-        self.micro_step_id = INITIAL_MICRO_STEP_ID
+        self.micro_step_id = 0
 
         print_rank_0(f"Inside Step function")
         see_memory_usage(f"In step before checking overflow", force=False)
