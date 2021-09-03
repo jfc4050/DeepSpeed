@@ -1886,6 +1886,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     [p.ds_id for p in self.__params_in_ipg_bucket])
 
             grad_partitions = self.__avg_scatter_grads(self.__params_in_ipg_bucket)
+            for partition in grad_partitions:
+                self.gpu_sum.add_(partition.float().sum())
             self.__partition_grads(self.__params_in_ipg_bucket, grad_partitions)
 
             for p in self.__params_in_ipg_bucket:
@@ -1904,7 +1906,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.__reduce_and_partition_stream.synchronize()
 
     @instrument_w_nvtx
-    def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> None:
+    def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> List[Tensor]:
         """average gradients and scatter partitions across ranks"""
         dtype = get_only_unique_item(p.grad.dtype for p in params_to_reduce)
 
@@ -2775,10 +2777,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     def has_overflow(self, partition_gradients=True):
         if partition_gradients:
-            local_overflow = self._has_inf_or_nan(self.gpu_sum)
-            self.gpu_sum.zero_()
+            with torch.cuda.stream(self.__reduce_and_partition_stream):
+                self.local_overflow = self._has_inf_or_nan(self.gpu_sum)
+                self.gpu_sum.zero_()
 
-            overflow_gpu = torch.cuda.ByteTensor([local_overflow])
+            overflow = self.local_overflow
+            #overflow = self.has_overflow_partitioned_grads_serial()
+            overflow_gpu = torch.cuda.ByteTensor([overflow])
             torch.distributed.all_reduce(overflow_gpu,
                                          op=torch.distributed.ReduceOp.MAX,
                                          group=self.dp_process_group)
