@@ -1744,28 +1744,34 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     @instrument_w_nvtx
     def independent_gradient_partition_epilogue(self):
-        torch.cuda.synchronize()
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         self.__reduce_and_partition_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
-        torch.cuda.synchronize()
+        self.__reduce_and_partition_stream.synchronize()
 
-        with torch.cuda.stream(self.__reduce_and_partition_stream):
+        # if dist.get_rank() == 0:
+        #    logger.info("Params already reduced %s", self.params_already_reduced)
+        for i in range(len(self.params_already_reduced)):
+            self.params_already_reduced[i] = False
+
+        #in case of cpu offload, averaged gradients are already in fp32_partitioned_groups_flat.grad
+        #TODO: use a similar code path for both cpu_offload and non-cpu offload
+        if not self.offload_optimizer:
             for i, sub_group in enumerate(self.fp16_groups):
-                self.averaged_gradients[i] = []
-                for param in sub_group:
-                    if param.requires_grad:
-                        self.averaged_gradients[i].append(
-                            self.__param_id_to_grad_partition[param.ds_id].narrow(
-                                0,
-                                0,
-                                param.ds_tensor.numel()))
-                    else:
-                        self.averaged_gradients[i].append(
-                            torch.zeros_like(param.ds_tensor))
-
-        torch.cuda.synchronize()
+                self.averaged_gradients[i] = [
+                    self.__param_id_to_grad_partition[param.ds_id].narrow(
+                        0,
+                        0,
+                        param.ds_tensor.numel())
+                    if param.requires_grad else torch.zeros_like(param.ds_tensor)
+                    for param in sub_group
+                ]
+                # self.averaged_gradients[i] = self.get_flat_partition(
+                #     self.fp16_groups[i],
+                #     0,
+                #     self.fp32_partitioned_groups_flat[i].numel(),
+                #     return_tensor_list=True)
 
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.independent_gradient_partition_epilogue()
