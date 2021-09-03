@@ -376,7 +376,16 @@ class PartitionedParameterCoordinator:
                     self.__inflight_param_registry.pop(param).wait()
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
 
-        torch.cuda.current_stream().wait_stream(self.__allgather_stream)
+        # for some reason training goes much faster when this is a synchronize
+        # call even though doing:
+        # torch.cuda.current_stream().wait_stream(self.__allgather_stream)
+        # would be sufficient. after looking at the profiler, when these arent synchronized
+        # there are random allgather/reduce-scatter calls that take huge amounts
+        # of time, but the problem disappears when the synchronization is present.
+        # also, this only seems to happen for larger models - for smaller models not
+        # synchronizing is faster as we would expect
+        # TODO. investigate why this happens
+        self.__allgather_stream.synchronize()
 
         self.__step_id += 1
 
@@ -1880,7 +1889,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 p.record_stream(torch.cuda.current_stream())
             self.__params_in_ipg_bucket.clear()
 
-        # FIXME: get rid of this safely
+        # for some reason training goes much faster when this is a synchronize
+        # call even though we shouldnt need to wait for this stream to complete
+        # until the optimizer step.
+        # after looking at the profiler, when these arent synchronized
+        # there are random allgather/reduce-scatter calls that take huge amounts
+        # of time, but the problem disappears when the synchronization is present.
+        # also, this only seems to happen for larger models - for smaller models not
+        # synchronizing is faster as we would expect
+        # TODO. investigate why this happens
         self.__reduce_and_partition_stream.synchronize()
 
     @instrument_w_nvtx
