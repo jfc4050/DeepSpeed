@@ -494,11 +494,14 @@ def test_zero3_param_partitioning_base(
             ds_engine.backward(activations["loss"].sum())
             _assert_partition_status(ds_engine, {ZeroParamStatus.NOT_AVAILABLE})
 
-            avgd_gradients = ds_engine.optimizer.averaged_gradients
-            assert set(avgd_gradients.keys()) == {0}, f"should have one parameter group but got {len(avgd_gradients)}"
-            weight_gradients: List[Tensor] = avgd_gradients[0]
+            # check the gradients
+            grad_partitions = ds_engine.optimizer.get_fp32_grad_partitions()
+            assert set(grad_partitions.keys()) == {0}, f"should have one parameter group but got {len(grad_partitions)}"
+            assert set(grad_partitions[0].keys()) == {0, 1, 2}
+            dloss_wrt_layer1 = grad_partitions[0][0]
+            dloss_wrt_layer2 = grad_partitions[0][1]
+            dloss_wrt_layer3 = grad_partitions[0][2]
 
-            dloss_wrt_layer1, dloss_wrt_layer2, dloss_wrt_layer3 = weight_gradients
             # layer1 = [..., 1, 2, ...]
             # layer2 = [..., 2, 4, ...]
             # layer3 = [..., 3, 6, ...]
@@ -534,7 +537,6 @@ def test_zero3_param_partitioning_base(
         # TODO. add testing for this - for now we just call it to make sure it
         # doesnt throw
         ds_engine.optimizer.step()
-        assert avgd_gradients[0] == None, avgd_gradients
 
     _test_zero3_param_partitioning()
 

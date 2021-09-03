@@ -2860,6 +2860,28 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         if self.swap_optimizer:
             self.optimizer_swapper.post_backward()
 
+    def get_fp32_grad_partitions(self) -> Dict[int, Dict[int, Tensor]]:
+        """get fp32 gradient partition dictionary
+        accessed as grad_dict[parameter_group_index][parameter_index]
+        """
+        self.__reduce_and_partition_stream.synchronize()
+        grad_dict = collections.defaultdict(dict)
+        if self.offload_optimizer:
+            for group in self.fp16_groups:
+                for param_idx, param in enumerate(group):
+                    group_idx, dest_offset, num_elements = self.grad_position[self.get_param_id(param)]
+                    fp32_grad = self.fp32_partitioned_groups_flat[group_idx].grad.narrow(
+                        0,
+                        dest_offset,
+                        num_elements)
+                    grad_dict[group_idx][param_idx] = fp32_grad
+        else:
+            for group_idx, group in self.averaged_gradients.items():
+                for param_idx, gradient in enumerate(group):
+                    grad_dict[group_idx][param_idx] = gradient
+
+        return grad_dict
+
     @instrument_w_nvtx
     def _partition_all_parameters(self):
         self.param_coordinator.release_and_reset_all()
