@@ -2346,14 +2346,16 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                             op=torch.distributed.ReduceOp.MAX)
             total_norm = total_norm_cuda[0].item()
         else:
+            # if dist.get_rank() == 0:
+            #    logger.info(f"Total Norm begining {total_norm}")
             grad_norms = []
             for g, p in zip(gradients, params):
-                if self.model_parallel_rank == 0 or is_model_parallel_parameter(p):
+                if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
                     grad_norms.append(g.cuda(non_blocking=True).double().norm(2))
 
+            # Sum across all model parallel GPUs.
             total_norm_cuda = torch.sum(torch.pow(torch.stack(grad_norms), 2))
 
-            # Sum across all model parallel GPUs.
             torch.distributed.all_reduce(total_norm_cuda,
                                          op=torch.distributed.ReduceOp.SUM,
                                          group=self.dp_process_group)
