@@ -2294,6 +2294,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         """
         Zero FP16 parameter grads.
         """
+        self.micro_step_id = 0
+
         # FP32 grad should never exist.
         # For speed, set model fp16 grad to None by default
         for group in self.fp16_groups:

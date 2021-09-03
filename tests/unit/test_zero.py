@@ -349,12 +349,14 @@ class EltwiseMultiplicationTestNetwork(Module):
 @pytest.mark.parametrize("fp16_enabled", [True, False])
 @pytest.mark.parametrize("contiguous_gradients", [False])
 @pytest.mark.parametrize("offload_optimizer", [True, False])
+@pytest.mark.parametrize("zero_grad", [True])
 @pytest.mark.parametrize("iteration", list(range(1)))
 def test_zero3_param_partitioning_base(
         param_persistence_threshold: int,
         fp16_enabled: bool,
         contiguous_gradients: bool,
         offload_optimizer: bool,
+        zero_grad: bool,
         iteration: int,
 ) -> None:
     @distributed_test(world_size=[2])
@@ -503,26 +505,31 @@ def test_zero3_param_partitioning_base(
             # dloss_wrt_layer3 = hidden2
             # dloss_wrt_layer2 = layer3 * hidden1
             # dloss_wrt_layer1 = layer3 * layer2 * x
+
+            grad_multiplier = 1 if zero_grad else (train_iter + 1)
             if dist.get_rank() == 0:
                 assert torch.allclose(dloss_wrt_layer3.cuda(),
-                                      (train_iter + 1) * create_tensor([2] * 8))
+                                      grad_multiplier * create_tensor([2] * 8))
                 assert torch.allclose(dloss_wrt_layer2.cuda(),
-                                      (train_iter + 1) * create_tensor([3 * 1] * 8))
+                                      grad_multiplier * create_tensor([3 * 1] * 8))
                 assert torch.allclose(dloss_wrt_layer1.cuda(),
-                                      (train_iter + 1) * create_tensor([3 * 2 * 1] * 8))
+                                      grad_multiplier * create_tensor([3 * 2 * 1] * 8))
             elif dist.get_rank() == 1:
                 # parameters dont split evenly across ranks so rank 1 has a zero-padded
                 # partition
                 assert torch.allclose(dloss_wrt_layer3.cuda(),
-                                      (train_iter + 1) * create_tensor(([8] * 7) + [0]))
-                assert torch.allclose(dloss_wrt_layer2.cuda(),
-                                      (train_iter + 1) *
-                                      create_tensor(([6 * 2] * 7) + [0]))
-                assert torch.allclose(dloss_wrt_layer1.cuda(),
-                                      (train_iter + 1) *
-                                      create_tensor(([6 * 4 * 1] * 7) + [0]))
+                                      grad_multiplier * create_tensor(([8] * 7) + [0]))
+                assert torch.allclose(
+                    dloss_wrt_layer2.cuda(),
+                    grad_multiplier * create_tensor(([6 * 2] * 7) + [0]))
+                assert torch.allclose(
+                    dloss_wrt_layer1.cuda(),
+                    grad_multiplier * create_tensor(([6 * 4 * 1] * 7) + [0]))
             else:
                 raise RuntimeError("test has world size of two")
+
+            if zero_grad:
+                ds_engine.optimizer.zero_grad()
 
         # TODO. add testing for this - for now we just call it to make sure it
         # doesnt throw
