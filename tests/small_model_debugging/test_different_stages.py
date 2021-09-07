@@ -11,9 +11,9 @@ def main():
     """"""
     stages = [0, 1, 2, 3]
     test_model_script = os.path.join(file_dir, 'test_model.py')
-    # for s in stages:
-    #     cmd = ['deepspeed', test_model_script, '--zero', str(s)]
-    #     subprocess.run(cmd)
+    for s in stages:
+        cmd = ['deepspeed', test_model_script, '--zero', str(s)]
+        subprocess.run(cmd)
     
     # read data
     default_name_format = "/tmp/loss_log_stage{}.h16.cgFalse.rcTrue.txt"
