@@ -384,6 +384,10 @@ class PartitionedParameterCoordinator:
         # of time, but the problem disappears when the synchronization is present.
         # also, this only seems to happen for larger models - for smaller models not
         # synchronizing is faster as we would expect
+        # some possible related issues
+        # - https://github.com/pytorch/pytorch/issues/43947
+        # - https://github.com/pytorch/pytorch/issues/44103
+        # - https://github.com/pytorch/pytorch/issues/63618
         # TODO. investigate why this happens
         self.__allgather_stream.synchronize()
 
