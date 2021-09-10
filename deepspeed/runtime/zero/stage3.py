@@ -404,7 +404,7 @@ class PartitionedParameterCoordinator:
                                  p.ds_id for p in iter_params(submodule)))
 
         for param in iter_params(submodule):
-            param.ds_active_sub_modules.remove(submodule.id)
+            param.ds_active_sub_modules.discard(submodule.id)
             if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param)
 
