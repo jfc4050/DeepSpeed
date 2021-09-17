@@ -11,7 +11,7 @@ from collections import OrderedDict, UserDict
 import itertools
 from typing import Dict, Iterable, Set, Union
 import torch
-from torch.cuda import Stream
+from torch.cuda import Event, Stream
 from torch.nn import Module, Parameter
 from torch.optim.optimizer import Optimizer
 import torch.distributed as dist
@@ -244,6 +244,8 @@ class PartitionedParameterCoordinator:
         # stream that will be used for allgather operations
         self.__allgather_stream: Stream = allgather_stream
 
+        self.__ongoing_fetch_events: collections.deque = collections.deque()
+
         dist.barrier()
 
     """Tracing and Tracking
@@ -424,7 +426,18 @@ class PartitionedParameterCoordinator:
 
         if partitioned_params:
             with torch.cuda.stream(self.__allgather_stream):
+                while self.__ongoing_fetch_events and self.__ongoing_fetch_events[
+                        0].query():
+                    self.__ongoing_fetch_events.popleft()
+
+                if len(self.__ongoing_fetch_events) > 5:
+                    self.__ongoing_fetch_events.popleft().synchronize()
+
                 handle = partitioned_params[0].all_gather_coalesced(partitioned_params)
+                event = Event()
+                event.record()
+                self.__ongoing_fetch_events.append(event)
+
             for param in partitioned_params:
                 assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
                 self.__inflight_param_registry[param] = handle
