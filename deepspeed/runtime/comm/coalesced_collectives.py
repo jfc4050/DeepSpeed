@@ -1,7 +1,6 @@
 """batched collective operations for overhead amortization and better
 bandwidth utilization"""
 
-import itertools
 import math
 from typing import List
 
@@ -15,6 +14,7 @@ from deepspeed.utils import instrument_w_nvtx
 
 
 @instrument_w_nvtx
+@torch.no_grad()
 def reduce_scatter_coalesced(
         tensors: List[Tensor],
         group: ProcessGroup = None,
@@ -33,25 +33,26 @@ def reduce_scatter_coalesced(
 
     # interleave tensor data such that the correct reduced partitions of each tensor
     # end up at each rank
-    tensor_partition_lst_for_each_rank: List[List[Tensor]] = [[None] * len(tensors)
-                                                              for _ in range(world_sz)]
+    tensor_partitions_for_each_rank: List[Tensor] = [None] * world_sz
+    tensor_partition_padded_sizes = [math.ceil(t.numel() / world_sz) for t in tensors]
     for rank in range(world_sz):
-        for tensor_idx, tensor in enumerate(tensors):
+        tensor_partitions_lst_with_padding = []
+
+        for tensor_idx in range(len(tensors)):
+            # add tensor content
             tensor_chunk = tensor_partitions[tensor_idx][rank]
+            tensor_partitions_lst_with_padding.append(tensor_chunk)
 
-            # the tensor size isn't always evenly divisible by world size - in these
-            # cases the partitions for later ranks need to be padded
-            n_to_pad = math.ceil(tensor.numel() / world_sz) - tensor_chunk.numel()
-            if n_to_pad:
-                tensor_chunk = torch.nn.functional.pad(tensor_chunk, (0, n_to_pad))
-            tensor_partition_lst_for_each_rank[rank][tensor_idx] = tensor_chunk
+            # add padding if necessary
+            padding_sz = tensor_partition_padded_sizes[tensor_idx] - tensor_chunk.numel()
+            if padding_sz > 0:
+                tensor_partitions_lst_with_padding.append(
+                    torch.empty(padding_sz,
+                                dtype=tensor_chunk.dtype,
+                                device=tensor_chunk.device))
 
-    tensor_partitions_for_each_rank_buffer = instrument_w_nvtx(torch.cat)(tuple(
-        itertools.chain.from_iterable(tensor_partition_lst_for_each_rank)))
-    tensor_partitions_for_each_rank_buffer.div_(world_sz)
-    tensor_partitions_for_each_rank = list(
-        torch.chunk(tensor_partitions_for_each_rank_buffer,
-                    world_sz))
+        tensor_partitions_for_each_rank[rank] = instrument_w_nvtx(
+            torch.cat)(tensor_partitions_lst_with_padding)
 
     # batched reduce-scatter call
     # TODO. try using _reduce_scatter_base
@@ -61,16 +62,19 @@ def reduce_scatter_coalesced(
         group=group,
     )
 
+    # post-divide
+    tensor_partitions_for_each_rank[this_rank].div_(world_sz)
+
     # reverse procedure of the interleaving done previously, done on the
     # result of the batched reduce-scatter
     output_lst: List[Tensor] = [None] * len(tensors)
     offset = 0
-    for tensor_idx, tensor in enumerate(tensors):
+    for tensor_idx in range(len(tensors)):
         output_lst[tensor_idx] = tensor_partitions_for_each_rank[this_rank].narrow(
             0,
             offset,
             tensor_partitions[tensor_idx][this_rank].numel())
 
-        offset += math.ceil(tensor.numel() / world_sz)
+        offset += tensor_partition_padded_sizes[tensor_idx]
 
     return output_lst
