@@ -687,6 +687,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         )
         see_memory_usage("After Partitioned Parameter Coordinator", force=False)
 
+        self.__n_caching_allocator_flushes = 0
+
         #self.param_coordinator = PartitionedParameterCoordinator(comm_stream=torch.cuda.Stream())
         #-------------Stage 3 Setup-------------------#
         # parameters smaller than the threshold will be collectively gathered at the
@@ -2697,6 +2699,19 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.stop_timers(['optimizer_step'])
 
         self._post_step(timer_names)
+
+        # warn user about caching allocator flushes
+        alloc_retries = torch.cuda.memory_stats()["num_alloc_retries"]
+        if alloc_retries > self.__n_caching_allocator_flushes:
+            self.__n_caching_allocator_flushes = alloc_retries
+            logger.warning(
+                "rank %d: %d pytorch allocator cache flushes. this happens "
+                "when there is high memory pressure and is highly detrimental to "
+                "performance. if this is happening frequently consider adjusting "
+                "settings to reduce memory consumption",
+                dist.get_rank(),
+                self.__n_caching_allocator_flushes)
+
         return
 
     def dump_pre_step_gradients(self, debug_fp32_grads):
