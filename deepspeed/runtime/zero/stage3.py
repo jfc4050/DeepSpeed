@@ -1781,7 +1781,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.independent_gradient_partition_epilogue()
-        self.zero_grad()
 
     def create_reduce_and_remove_grad_hooks(self):
         print_rank_0(f'[Begin] Create gradient reduction hooks')

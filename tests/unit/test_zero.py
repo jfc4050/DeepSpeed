@@ -596,14 +596,16 @@ def test_zero3_param_partitioning_large_param(world_sz: int, param_sz: int):
                                     rank_idx))
 
             ds_engine.backward(activation.sum())
+            ds_engine.allreduce_gradients()
 
             avgd_gradients = ds_engine.optimizer.averaged_gradients
             assert set(avgd_gradients.keys()) == {0}, "should only have one parameter group"
             weight_gradient, = avgd_gradients[0]
+            expected_weight_gradient = (train_iter + 1) * torch.full_like(
+                weight_gradient,
+                1)
 
-            assert torch.allclose(weight_gradient,
-                                  (train_iter + 1) * torch.full_like(weight_gradient,
-                                                                     1))
+            assert torch.allclose(weight_gradient, expected_weight_gradient)
 
     _distributed_test()
 
