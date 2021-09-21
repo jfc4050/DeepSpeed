@@ -1888,6 +1888,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         assert len(set(p.ds_id for p in self.__params_in_ipg_bucket)) == len(
             self.__params_in_ipg_bucket)
 
+        self.__reduce_and_partition_stream.synchronize()
         with torch.cuda.stream(self.__reduce_and_partition_stream):
             if safe_mode:
                 assert_ints_same_as_other_ranks(
@@ -2703,13 +2704,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         alloc_retries = torch.cuda.memory_stats()["num_alloc_retries"]
         if alloc_retries > self.__n_caching_allocator_flushes:
             self.__n_caching_allocator_flushes = alloc_retries
-            logger.warning(
-                "rank %d: %d pytorch allocator cache flushes. this happens "
-                "when there is high memory pressure and is highly detrimental to "
-                "performance. if this is happening frequently consider adjusting "
-                "settings to reduce memory consumption",
-                dist.get_rank(),
-                self.__n_caching_allocator_flushes)
+            if dist.get_rank() == 0:
+                logger.warning(
+                    "%d pytorch allocator cache flushes. this happens "
+                    "when there is high memory pressure and is highly detrimental to "
+                    "performance. if this is happening frequently consider adjusting "
+                    "settings to reduce memory consumption",
+                    self.__n_caching_allocator_flushes)
 
         return
 
