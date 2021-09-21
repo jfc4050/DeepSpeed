@@ -174,7 +174,7 @@ _orig_torch_empty = torch.empty
 
 
 def empty_cuda_tensor_half(*size, **kwargs):
-    if not 'device' in kwargs.keys():
+    if kwargs.get("device", None) is None:
         kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
     tensor = _orig_torch_empty(*size, **kwargs)
     if tensor.is_floating_point():
@@ -193,7 +193,7 @@ def new_cuda_tensor_half(cls, *args):
 
 
 def empty_cuda_tensor(*size, **kwargs):
-    if not 'device' in kwargs.keys():
+    if kwargs.get("device", None) is None:
         kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
     tensor = _orig_torch_empty(*size, **kwargs)
     return tensor
