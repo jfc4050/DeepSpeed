@@ -6,7 +6,7 @@ Licensed under the MIT license.
 import os
 import time
 import types
-from typing import Iterable
+from typing import Callable, Iterable
 from enum import Enum
 import functools
 import itertools
@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 import torch.distributed
 from torch.distributed.distributed_c10d import _get_global_rank
+from torch.nn import Module
 from torch.nn import Parameter
 
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
@@ -171,16 +172,22 @@ class ZeroParamStatus(Enum):
 
 
 _orig_torch_empty = torch.empty
+_orig_torch_zeros = torch.zeros
+_orig_torch_ones = torch.ones
+_orig_torch_full = torch.full
 
 
-def empty_cuda_tensor_half(*size, **kwargs):
-    if kwargs.get("device", None) is None:
-        kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
-    tensor = _orig_torch_empty(*size, **kwargs)
-    if tensor.is_floating_point():
-        return tensor.half()
-    else:
-        return tensor
+def zero_wrapper_for_fp16_tensor_constructor(fn):
+    def wrapped_fn(*args, **kwargs):
+        if kwargs.get("device", None) is None:
+            kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
+        tensor = fn(*args, **kwargs)
+        if tensor.is_floating_point():
+            return tensor.half()
+        else:
+            return tensor
+
+    return wrapped_fn
 
 
 def new_cuda_tensor_half(cls, *args):
@@ -250,6 +257,58 @@ class InsertPostInitMethodToModuleSubClasses(object):
         if not self.enabled:
             return
 
+        def apply_with_gather(orig_module_apply_fn: Callable) -> Callable:
+            """many models make use of child modules like Linear or Embedding which
+            perform their own weight initialization in their __init__ methods,
+            but will then have more weight initialization in a parent module's __init__
+            method that modifies weights of child modules, which is typically done
+            using the Module.apply method.
+
+            since the Init context manager partitions child modules immediately after
+            they are initialized, without modifying apply we would entirely skip
+            any initialization done by parent modules.
+
+            to get around this issue, we wrap the function passed to Module.apply
+            so that the applied function is applied to child modules correctly.
+            """
+            def get_wrapped_fn_to_apply(fn_to_apply: Callable) -> Callable:
+                @functools.wraps(fn_to_apply)
+                def wrapped_fn_to_apply(module_to_apply_fn_to: Module) -> None:
+                    """gathers parameters before calling apply function. afterwards
+                    parameters are broadcasted to ensure consistency across all ranks
+                    then re-partitioned.
+
+                    takes the following steps:
+                    1. allgathers parameters for the current module being worked on
+                    2. calls the original function
+                    3. broadcasts root rank's parameters to the other ranks
+                    4. re-partitions the parameters
+                    """
+                    params_to_apply_fn_to: Iterable[Parameter] = list(
+                        sorted(module_to_apply_fn_to.parameters(recurse=False),
+                               key=lambda p: p.ds_id))
+
+                    for param in params_to_apply_fn_to:
+                        param.all_gather()
+
+                    fn_to_apply(module_to_apply_fn_to)
+
+                    for param in params_to_apply_fn_to:
+                        torch.distributed.broadcast(param.data,
+                                                    0,
+                                                    group=param.ds_process_group)
+
+                    for param in params_to_apply_fn_to:
+                        param.partition(has_been_updated=True)
+
+                return wrapped_fn_to_apply
+
+            @functools.wraps(orig_module_apply_fn)
+            def wrapped_apply(module: Module, fn_to_apply: Callable) -> None:
+                orig_module_apply_fn(module, get_wrapped_fn_to_apply(fn_to_apply))
+
+            return wrapped_apply
+
         def partition_after(f):
             @functools.wraps(f)
             def wrapper(module, *args, **kwargs):
@@ -299,15 +358,22 @@ class InsertPostInitMethodToModuleSubClasses(object):
             # print(f"subclass={subclass.__module__}.{subclass.__qualname__}")
             _enable_class(subclass)
 
-        # holding on to the current __init__subclass__ for exit
+        # holding onto some methods so we can put them back the way they were in __exit__
         torch.nn.modules.module.Module._old_init_subclass = torch.nn.modules.module.Module.__init_subclass__
+        torch.nn.modules.module.Module._old_apply = torch.nn.modules.module.Module.apply
         torch.Tensor.__old_new__ = torch.Tensor.__new__
 
         # Replace .__init__() for future subclasses of torch.nn.Module
         torch.nn.modules.module.Module.__init_subclass__ = classmethod(_init_subclass)
+        torch.nn.modules.module.Module.apply = apply_with_gather(
+            torch.nn.modules.module.Module._old_apply)
+
         if self.dtype == torch.half:
             torch.Tensor.__new__ = new_cuda_tensor_half
-            torch.empty = empty_cuda_tensor_half
+            torch.empty = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_empty)
+            torch.zeros = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_zeros)
+            torch.ones = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_ones)
+            torch.full = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_full)
         else:
             torch.Tensor.__new__ = new_cuda_tensor
             torch.empty = empty_cuda_tensor
@@ -330,11 +396,15 @@ class InsertPostInitMethodToModuleSubClasses(object):
         for subclass in get_all_subclasses(torch.nn.modules.module.Module):
             _disable_class(subclass)
 
-        # Replace .__init__() for future subclasses of torch.nn.Module
+        # putting methods back the way we found them
         torch.nn.modules.module.Module.__init_subclass__ = torch.nn.modules.module.Module._old_init_subclass
+        torch.nn.modules.module.Module.apply = torch.nn.modules.module.Module._old_apply
 
         torch.Tensor.__new__ = torch.Tensor.__old_new__
         torch.empty = _orig_torch_empty
+        torch.zeros = _orig_torch_zeros
+        torch.ones = _orig_torch_ones
+        torch.full = _orig_torch_full
 
         #un doing it here will undo it during training
         #if self.mem_efficient_linear:
@@ -589,13 +659,20 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             force=False)
 
         global param_count
-        for param in module.parameters(recurse=False):
+        for param_name, param in module.named_parameters(recurse=False):
             param_count += param.numel()
             if not is_zero_param(param):
                 self._convert_to_deepspeed_param(param)
                 print_rank_0(
                     f"Partitioning param {debug_param2name_id_shape(param)} module={debug_module2name(module)}"
                 )
+
+                if not param.is_cuda:
+                    raise RuntimeError(
+                        f"param {param_name} in module {module.__class__.__name__} "
+                        f"expected to be on GPU but was on {param.device}")
+                torch.distributed.broadcast(param, 0, self.ds_process_group)
+
                 param.partition()
         see_memory_usage(
             f"Param count {param_count}. After converting and partitioning parmas in {module.__class__.__name__}",

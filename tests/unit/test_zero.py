@@ -4,7 +4,7 @@ import pytest
 import torch.distributed as dist
 import torch
 from torch import Tensor
-from torch.nn import Module
+from torch.nn import Linear, Module
 from torch.nn.modules.container import ModuleList
 from torch.nn.modules.loss import L1Loss
 from torch.nn.parameter import Parameter
@@ -543,42 +543,53 @@ def test_zero3_param_partitioning_base(
 
 @pytest.mark.parametrize("world_sz", [1, 2, 4])
 @pytest.mark.parametrize("param_sz", [8100])
-def test_zero3_param_partitioning_large_param(world_sz: int, param_sz: int):
+@pytest.mark.parametrize("init_context_manager", [True, False])
+def test_zero3_param_partitioning_large_param(world_sz: int,
+                                              param_sz: int,
+                                              init_context_manager: bool) -> None:
     class LargeParamModel(Module):
         def __init__(self):
             super().__init__()
-            self.param = Parameter(torch.empty(param_sz, dtype=torch.float32))
+            self.param = Parameter(torch.zeros((param_sz, ), dtype=torch.float32))
+
+            # only do weight initialization on root rank to
+            # make sure we are broadcasting correctly from rank 0
+            if dist.get_rank() == 0:
+                partition_sz = math.ceil(self.param.numel() / dist.get_world_size())
+                offset = 0
+                for rank in range(dist.get_world_size()):
+                    with torch.no_grad():
+                        self.param[offset:offset + partition_sz].fill_(rank)
+                    offset += partition_sz
 
         def forward(self, x: Tensor) -> Tensor:
             return x * self.param
 
     @distributed_test(world_size=[world_sz])
     def _distributed_test():
-        model = LargeParamModel()
-        ds_engine = _ds_initialize_for_param_partitioning_testing(
-            model,
-            {
-                "train_micro_batch_size_per_gpu": 1,
-                "zero_optimization": {
-                    "stage": 3,
-                    "stage3_max_reuse_distance": 0,
-                    "contiguous_gradients": True,
-                    "overlap_comm": True,
-                },
-                "optimizer": {
-                    "type": "Adam",
-                    "params": {
-                        "lr": 1.
-                    }
-                },
-                "fp16": {
-                    "enabled": True,
-                    "loss_scale": 1.,
+        ds_config = {
+            "train_micro_batch_size_per_gpu": 1,
+            "zero_optimization": {
+                "stage": 3,
+                "stage3_max_reuse_distance": 0,
+                "contiguous_gradients": True,
+                "overlap_comm": True,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1.
                 }
-            })
-
-        model.param.ds_tensor.data = torch.full_like(model.param.ds_tensor.data,
-                                                     dist.get_rank())
+            },
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 1.,
+            }
+        }
+        with deepspeed.zero.Init(mem_efficient_linear=False,
+                                 enabled=init_context_manager):
+            model = LargeParamModel()
+        ds_engine = _ds_initialize_for_param_partitioning_testing(model, ds_config)
 
         for train_iter in range(3):  # test multiple iterations to cover prefetching
             activation: Tensor = ds_engine(
@@ -613,7 +624,11 @@ def test_zero3_param_partitioning_large_param(world_sz: int, param_sz: int):
 @pytest.mark.parametrize("world_sz", [1, 2, 4])
 @pytest.mark.parametrize("param_sz", [100, 1_000, 10_000])
 @pytest.mark.parametrize("n_layers", [100, 1_000])
-def test_zero3_param_partitioning_many_params(world_sz, param_sz, n_layers):
+@pytest.mark.parametrize("init_context_manager", [True, False])
+def test_zero3_param_partitioning_many_params(world_sz: int,
+                                              param_sz: int,
+                                              n_layers: int,
+                                              init_context_manager: bool) -> None:
     class ManyParamModel(Module):
         def __init__(self) -> None:
             super().__init__()
@@ -624,6 +639,17 @@ def test_zero3_param_partitioning_many_params(world_sz, param_sz, n_layers):
                                                   ),
                                                  dtype=torch.float32)))
                 for _ in range(n_layers))
+
+            for layer_num, module in enumerate(self.modulelist):
+                if dist.get_rank() == 0:
+                    param: Parameter = module.weight
+                    partition_sz = math.ceil(param.numel() / dist.get_world_size())
+                    offset = 0
+                    for rank in range(dist.get_world_size()):
+                        with torch.no_grad():
+                            param[offset:offset + partition_sz].fill_(2 * layer_num *
+                                                                      rank)
+                        offset += partition_sz
 
         def forward(self, x: Tensor) -> Tensor:
             activations = []
@@ -637,32 +663,32 @@ def test_zero3_param_partitioning_many_params(world_sz, param_sz, n_layers):
 
     @distributed_test(world_size=[world_sz])
     def _distributed_test():
-        model = ManyParamModel()
-        ds_engine = _ds_initialize_for_param_partitioning_testing(
-            model,
-            {
-                "train_micro_batch_size_per_gpu": 1,
-                "zero_optimization": {
-                    "stage": 3,
-                    "stage3_max_reuse_distance": 0,
-                    "contiguous_gradients": True,
-                    "overlap_comm": True,
-                },
-                "optimizer": {
-                    "type": "Adam",
-                    "params": {
-                        "lr": 1.
-                    }
-                },
-                "fp16": {
-                    "enabled": True,
-                    "loss_scale": 1.,
+        ds_cfg = {
+            "train_micro_batch_size_per_gpu": 1,
+            "zero_optimization": {
+                "stage": 3,
+                "stage3_max_reuse_distance": 0,
+                "contiguous_gradients": True,
+                "overlap_comm": True,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1.
                 }
-            })
-        for layer_num in range(n_layers):
-            param = model.modulelist[layer_num].weight
-            param.ds_tensor.data = torch.full_like(param.ds_tensor.data,
-                                                   2 * layer_num * dist.get_rank())
+            },
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 1.,
+            }
+        }
+
+        with deepspeed.zero.Init(config=ds_cfg,
+                                 mem_efficient_linear=False,
+                                 enabled=init_context_manager):
+            model = ManyParamModel()
+
+        ds_engine = _ds_initialize_for_param_partitioning_testing(model, ds_cfg)
 
         for _ in range(3):  # test multiple iterations to cover prefetching
             activations: List[Tensor] = ds_engine(
@@ -694,5 +720,55 @@ def test_zero3_param_partitioning_many_params(world_sz, param_sz, n_layers):
 
             for layer_num, activation in enumerate(weight_gradients):
                 pass
+
+    _distributed_test()
+
+
+@pytest.mark.parametrize("world_sz", [1, 2, 4])
+def test_zero3_init_for_parent_weight_initialization(world_sz):
+    class ModelWhereParentInitializesChildWeights(Module):
+        def __init__(self) -> None:
+            super().__init__()
+
+            self.linear = Linear(12, 1)
+
+            self.apply(self.__init_weights)
+
+        def __init_weights(self, module):
+            if isinstance(module, Linear):
+                with torch.no_grad():
+                    module.weight.fill_(1 + dist.get_rank())
+
+    @distributed_test(world_size=[world_sz])
+    def _distributed_test():
+        ds_cfg = {
+            "train_micro_batch_size_per_gpu": 1,
+            "zero_optimization": {
+                "stage": 3,
+                "stage3_max_reuse_distance": 0,
+                "contiguous_gradients": True,
+                "overlap_comm": True,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1.
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 1.,
+            }
+        }
+
+        with deepspeed.zero.Init(config=ds_cfg,
+                                 mem_efficient_linear=False,
+                                 enabled=True):
+            model = ModelWhereParentInitializesChildWeights()
+
+        assert model.linear.weight.ds_tensor.numel() == math.ceil(12 / world_sz)
+        assert torch.allclose(model.linear.weight.ds_tensor,
+                              torch.full_like(model.linear.weight.ds_tensor,
+                                              1))
 
     _distributed_test()
