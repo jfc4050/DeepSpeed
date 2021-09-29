@@ -443,7 +443,7 @@ class EltwiseMultiplicationTestNetwork(Module):
 
 @pytest.mark.parametrize("param_persistence_threshold", [0, 10])
 @pytest.mark.parametrize("fp16_enabled", [True, False])
-@pytest.mark.parametrize("contiguous_gradients", [False])
+@pytest.mark.parametrize("contiguous_gradients", [True, False])
 @pytest.mark.parametrize("offload_optimizer", [True, False])
 @pytest.mark.parametrize("zero_grad", [True])
 @pytest.mark.parametrize("iteration", list(range(1)))
@@ -496,11 +496,11 @@ def test_zero3_param_partitioning_base(
             weight.ds_tensor.data = torch.full_like(weight.ds_tensor.data,
                                                     (i + 1) * (1 + dist.get_rank()))
 
-        def create_tensor(vals):
-            return torch.as_tensor(
-                vals,
-                dtype=torch.float16 if fp16_enabled else torch.float32,
-                device=ds_engine.device)
+        def create_tensor(vals, dtype: torch.dtype = None) -> Tensor:
+            return torch.as_tensor(vals,
+                                   dtype=dtype
+                                   or (torch.float16 if fp16_enabled else torch.float32),
+                                   device=ds_engine.device)
 
         expected_hidden1 = create_tensor([
             [1,
@@ -598,6 +598,10 @@ def test_zero3_param_partitioning_base(
             dloss_wrt_layer2 = grad_partitions[0][1]
             dloss_wrt_layer3 = grad_partitions[0][2]
 
+            assert dloss_wrt_layer1.dtype == torch.float
+            assert dloss_wrt_layer2.dtype == torch.float
+            assert dloss_wrt_layer3.dtype == torch.float
+
             # layer1 = [..., 1, 2, ...]
             # layer2 = [..., 2, 4, ...]
             # layer3 = [..., 3, 6, ...]
@@ -607,23 +611,33 @@ def test_zero3_param_partitioning_base(
 
             grad_multiplier = 1 if zero_grad else (train_iter + 1)
             if dist.get_rank() == 0:
-                assert torch.allclose(dloss_wrt_layer3.cuda(),
-                                      grad_multiplier * create_tensor([2] * 8))
-                assert torch.allclose(dloss_wrt_layer2.cuda(),
-                                      grad_multiplier * create_tensor([3 * 1] * 8))
-                assert torch.allclose(dloss_wrt_layer1.cuda(),
-                                      grad_multiplier * create_tensor([3 * 2 * 1] * 8))
+                assert torch.allclose(
+                    dloss_wrt_layer3.cuda(),
+                    grad_multiplier * create_tensor([2] * 8,
+                                                    torch.float))
+                assert torch.allclose(
+                    dloss_wrt_layer2.cuda(),
+                    grad_multiplier * create_tensor([3 * 1] * 8,
+                                                    torch.float))
+                assert torch.allclose(
+                    dloss_wrt_layer1.cuda(),
+                    grad_multiplier * create_tensor([3 * 2 * 1] * 8,
+                                                    torch.float))
             elif dist.get_rank() == 1:
                 # parameters dont split evenly across ranks so rank 1 has a zero-padded
                 # partition
-                assert torch.allclose(dloss_wrt_layer3.cuda(),
-                                      grad_multiplier * create_tensor(([8] * 7) + [0]))
+                assert torch.allclose(
+                    dloss_wrt_layer3.cuda(),
+                    grad_multiplier * create_tensor(([8] * 7) + [0],
+                                                    torch.float))
                 assert torch.allclose(
                     dloss_wrt_layer2.cuda(),
-                    grad_multiplier * create_tensor(([6 * 2] * 7) + [0]))
+                    grad_multiplier * create_tensor(([6 * 2] * 7) + [0],
+                                                    torch.float))
                 assert torch.allclose(
                     dloss_wrt_layer1.cuda(),
-                    grad_multiplier * create_tensor(([6 * 4 * 1] * 7) + [0]))
+                    grad_multiplier * create_tensor(([6 * 4 * 1] * 7) + [0],
+                                                    torch.float))
             else:
                 raise RuntimeError("test has world size of two")
 

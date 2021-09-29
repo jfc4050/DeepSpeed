@@ -2907,7 +2907,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         else:
             for group_idx, group in self.averaged_gradients.items():
                 for param_idx, gradient in enumerate(group):
-                    grad_dict[group_idx][param_idx] = gradient
+                    grad_dict[group_idx][param_idx] = gradient.float()
 
         return grad_dict
 
