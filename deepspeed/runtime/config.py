@@ -113,11 +113,15 @@ def get_fp16_enabled(param_dict):
     else:
         return False
 
+
 def get_bfloat16_enabled(param_dict):
     if BFLOAT16 in param_dict.keys():
-        return get_scalar_param(param_dict[BFLOAT16], BFLOAT16_ENABLED, BFLOAT16_ENABLED_DEFAULT)
+        return get_scalar_param(param_dict[BFLOAT16],
+                                BFLOAT16_ENABLED,
+                                BFLOAT16_ENABLED_DEFAULT)
     else:
         return False
+
 
 def get_fp16_master_weights_and_grads_enabled(param_dict):
     if get_fp16_enabled(param_dict):
@@ -137,6 +141,7 @@ def get_loss_scale(param_dict):
         return 1.0
     else:
         return FP16_LOSS_SCALE_DEFAULT
+
 
 def get_initial_dynamic_scale(param_dict):
     if get_fp16_enabled(param_dict):
@@ -801,7 +806,7 @@ class DeepSpeedConfig(object):
             param_dict)
         self.bfloat16_enabled = get_bfloat16_enabled(param_dict)
         assert not (self.fp16_enabled and self.bfloat16_enabled), 'bfloat16 and fp16 modes cannot be simultaneously enabled'
-        assert not (self.bfloat16_enabled and (self.zero_optimization_stage != 2)), 'bfloat16 mode is only enabled for Zero2 currently'
+        assert not (self.bfloat16_enabled and (self.zero_optimization_stage not in {2, 3})), f"bfloat16 mode is only enabled for ZeRO 2 and 3 currently, got {self.zero_optimization_stage}"
         self.amp_enabled = get_amp_enabled(param_dict)
         self.amp_params = get_amp_params(param_dict)
         self.loss_scale = get_loss_scale(param_dict)

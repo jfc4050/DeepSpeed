@@ -177,39 +177,30 @@ _orig_torch_ones = torch.ones
 _orig_torch_full = torch.full
 
 
-def zero_wrapper_for_fp16_tensor_constructor(fn):
-    def wrapped_fn(*args, **kwargs):
+def zero_wrapper_for_fp_tensor_constructor(fn: Callable,
+                                           target_fp_dtype: torch.dtype) -> Callable:
+    def wrapped_fn(*args, **kwargs) -> Tensor:
         if kwargs.get("device", None) is None:
             kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
-        tensor = fn(*args, **kwargs)
+        tensor: Tensor = fn(*args, **kwargs)
         if tensor.is_floating_point():
-            return tensor.half()
-        else:
-            return tensor
+            tensor = tensor.to(target_fp_dtype)
+
+        return tensor
 
     return wrapped_fn
 
 
-def new_cuda_tensor_half(cls, *args):
-    device = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
-    tensor = torch.ones((1, 1), device=device).new_empty(*args).half()
-    if tensor.is_floating_point():
-        return tensor.half()
-    else:
+def get_new_tensor_fn_for_dtype(dtype: torch.dtype) -> Callable:
+    def new_tensor(cls, *args) -> Tensor:
+        device = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
+        tensor = _orig_torch_empty(0, device=device).new_empty(*args)
+        if tensor.is_floating_point():
+            tensor = tensor.to(dtype)
+
         return tensor
 
-
-def empty_cuda_tensor(*size, **kwargs):
-    if kwargs.get("device", None) is None:
-        kwargs['device'] = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
-    tensor = _orig_torch_empty(*size, **kwargs)
-    return tensor
-
-
-def new_cuda_tensor(cls, *args):
-    device = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
-    tensor = torch.ones((1, 1), device=device).new_empty(*args)
-    return tensor
+    return new_tensor
 
 
 # https://stackoverflow.com/a/63851681/9201239
@@ -255,7 +246,7 @@ class InsertPostInitMethodToModuleSubClasses(object):
         self.mem_efficient_linear = mem_efficient_linear
         self.enabled = enabled
         self._set_dtype(ds_config, dtype)
-        assert self.dtype in [torch.half, torch.float], f"Invalid data type {self.dtype}, allowed values are [torch.half, torch.float]"
+        assert self.dtype in [torch.half, torch.bfloat16, torch.float], f"Invalid data type {self.dtype}, allowed values are [torch.half, torch.bfloat16, torch.float]"
 
     def __enter__(self):
         if not self.enabled:
@@ -372,15 +363,13 @@ class InsertPostInitMethodToModuleSubClasses(object):
         torch.nn.modules.module.Module.apply = apply_with_gather(
             torch.nn.modules.module.Module._old_apply)
 
-        if self.dtype == torch.half:
-            torch.Tensor.__new__ = new_cuda_tensor_half
-            torch.empty = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_empty)
-            torch.zeros = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_zeros)
-            torch.ones = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_ones)
-            torch.full = zero_wrapper_for_fp16_tensor_constructor(_orig_torch_full)
-        else:
-            torch.Tensor.__new__ = new_cuda_tensor
-            torch.empty = empty_cuda_tensor
+        torch.Tensor.__new__ = get_new_tensor_fn_for_dtype(self.dtype)
+        torch.empty = zero_wrapper_for_fp_tensor_constructor(_orig_torch_empty,
+                                                             self.dtype)
+        torch.zeros = zero_wrapper_for_fp_tensor_constructor(_orig_torch_zeros,
+                                                             self.dtype)
+        torch.ones = zero_wrapper_for_fp_tensor_constructor(_orig_torch_ones, self.dtype)
+        torch.full = zero_wrapper_for_fp_tensor_constructor(_orig_torch_full, self.dtype)
 
         if self.mem_efficient_linear:
             print_rank_0(
@@ -426,11 +415,17 @@ class InsertPostInitMethodToModuleSubClasses(object):
 
     def _set_dtype(self, ds_config, dtype):
         if ds_config is not None and dtype is None:
-            self.dtype = torch.half if ds_config.fp16_enabled else torch.float
-        elif dtype is None:
-            self.dtype = torch.half
+            if ds_config.bfloat16_enabled and ds_config.fp16_enabled:
+                raise RuntimeError("bfloat16 and fp16 cannot be enabled at once")
+
+            if ds_config.bfloat16_enabled:
+                self.dtype = torch.bfloat16
+            elif ds_config.fp16_enabled:
+                self.dtype = torch.half
+            else:
+                self.dtype = torch.float
         else:
-            self.dtype = dtype
+            self.dtype = dtype or torch.half
 
 
 class AllGatherCoalescedHandle:

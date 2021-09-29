@@ -98,6 +98,7 @@ def print_configuration(args, name):
         dots = '.' * (29 - len(arg))
         logger.info('  {} {} {}'.format(arg, dots, getattr(args, arg)))
 
+
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training.
     """
@@ -702,34 +703,32 @@ class DeepSpeedEngine(Module):
                                    self.broadcast_src_rank,
                                    group=self.data_parallel_group)
 
+    @staticmethod
+    def __check_params(model: Module, dtype: torch.dtype) -> None:
+        if not all(param.dtype == dtype
+                   for param in model.parameters()) and dist.get_rank() == 0:
+            raise ValueError(
+                f"{dtype} is enabled but the following parameters have dtype that is "
+                f"not {dtype}: "
+                f"{[(n, p.dtype) for n, p in model.named_parameters() if p.dtype != dtype]}"
+            )
+
     def _configure_distributed_model(self, model):
         self.module = model
         if self.fp16_enabled():
             if self.zero_optimization_partition_weights() and any(
                 [hasattr(param,
                          'ds_id') for param in self.module.parameters()]):
-                if not all(
-                    [param.dtype == torch.half for param in self.module.parameters()]):
-                    names = [
-                        n for n,
-                        p in self.module.named_parameters() if p.dtype != torch.half
-                    ]
-                    raise ValueError(
-                        f"fp16 is enabled but the following parameters have dtype that is not fp16: {', '.join(names)}"
-                    )
+                self.__check_params(self.module, torch.half)
             self.module.half()
         elif self.bfloat16_enabled():
+            if self.zero_optimization_partition_weights() and any(
+                    hasattr(param,
+                            'ds_id') for param in self.module.parameters()):
+                self.__check_params(self.module, torch.bfloat16)
             self.module.bfloat16()
         else:
-            if not all(
-                [param.dtype == torch.float for param in self.module.parameters()]):
-                names = [
-                    n for n,
-                    p in self.module.named_parameters() if p.dtype != torch.float
-                ]
-                raise ValueError(
-                    f"fp32 is enabled but the following parameters have dtype that is not fp32: {', '.join(names)}"
-                )
+            self.__check_params(self.module, torch.float)
 
         if not self.dont_change_device:
             self.module.to(self.device)
