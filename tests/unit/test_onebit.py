@@ -1,22 +1,18 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 import deepspeed
-import argparse
 import pytest
 import copy
-import json
 import os
 import numpy as np
-import time
 
-from deepspeed.runtime.pipe.topology import PipeDataParallelTopology, PipeModelDataParallelTopology
+from deepspeed.runtime.pipe.topology import PipeDataParallelTopology
 PipeTopo = PipeDataParallelTopology
-from deepspeed.runtime.pipe.module import PipelineModule, LayerSpec
-from common import distributed_test
-from simple_model import SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict, create_deepspeed_args
-from test_pipe import AlexNetPipe, train_cifar
+from deepspeed.runtime.pipe.module import PipelineModule
+from .common import distributed_test
+from .simple_model import SimpleModel, random_dataloader, args_from_dict
+from .test_pipe import AlexNetPipe, train_cifar
 
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
 TORCH_MINOR = int(torch.__version__.split('.')[1])

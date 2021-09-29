@@ -117,8 +117,7 @@ def op_envvar(op_name):
 
 
 def op_enabled(op_name):
-    env_var = op_envvar(op_name)
-    return int(os.environ.get(env_var, BUILD_OP_DEFAULT))
+    return 0
 
 
 compatible_ops = dict.fromkeys(ALL_OPS.keys(), False)

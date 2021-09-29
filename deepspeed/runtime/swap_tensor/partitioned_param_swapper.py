@@ -5,6 +5,7 @@ Licensed under the MIT license.
 Functionality of swapping tensors to/from (NVMe) storage devices.
 """
 
+from deepspeed.utils.nvtx import instrument_w_nvtx
 import os
 from enum import Enum
 import torch
@@ -206,6 +207,7 @@ class AsyncPartitionedParameterSwapper(object):
         self.swap_out_params = []
 
     #waits for inflight nvme reads to complete
+    @instrument_w_nvtx
     def synchronize_reads(self):
         if self.pending_reads == 0:
             return
@@ -286,6 +288,7 @@ class AsyncPartitionedParameterSwapper(object):
         self.pending_reads += len(params)
 
     #assigns an in memory buffer and swaps in from nvme
+    @instrument_w_nvtx
     def swap_in(self, params, async_op=True, swap_in_buffers=None):
 
         assert all([param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE for param in params]), "Some params are already available or in flight"

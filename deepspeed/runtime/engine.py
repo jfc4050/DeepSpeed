@@ -42,7 +42,7 @@ from deepspeed.runtime.zero.constants import \
 from deepspeed.runtime.csr_tensor import CSRTensor
 import deepspeed.runtime.lr_schedules as lr_schedules
 import deepspeed.utils.groups as groups
-from deepspeed.utils import logger, log_dist, init_distributed
+from deepspeed.utils import logger, log_dist, init_distributed, instrument_w_nvtx
 from deepspeed.utils.timer import ThroughputTimer, SynchronizedWallClockTimer
 from deepspeed.utils.debug import debug_extract_module_and_param_names
 from deepspeed.runtime.progressive_layer_drop import ProgressiveLayerDrop
@@ -1230,6 +1230,7 @@ class DeepSpeedEngine(Module):
 
         return scaled_loss
 
+    @instrument_w_nvtx
     def forward(self, *inputs, **kwargs):
         r"""Execute forward propagation
 
@@ -1267,7 +1268,8 @@ class DeepSpeedEngine(Module):
         if self.training_dataloader is None:
             self.tput_timer.start()
 
-        loss = self.module(*inputs, **kwargs)
+        with torch.cuda.nvtx.range("DeepspeedEngine.forward::module_forward"):
+            loss = self.module(*inputs, **kwargs)
 
         if self.zero_optimization_partition_weights():
             # Reset the ZeRO-3 state if we are only doing forward-passes (ie evaluation).
@@ -1296,6 +1298,7 @@ class DeepSpeedEngine(Module):
 
         return loss
 
+    @instrument_w_nvtx
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
         # Pass (PP) gas boundary flag to optimizer (required for zero)
         self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary(
@@ -1313,6 +1316,7 @@ class DeepSpeedEngine(Module):
             else:
                 self.buffered_allreduce_fallback(elements_per_buffer=bucket_size)
 
+    @instrument_w_nvtx
     def backward(self, loss, allreduce_gradients=True, release_loss=False):
         r"""Execute backward pass on the loss
 

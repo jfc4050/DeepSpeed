@@ -1,16 +1,30 @@
 import torch
 import deepspeed
-import argparse
 import pytest
-import json
-import os
-from common import distributed_test
-from simple_model import SimpleModel, SimpleOptimizer, random_dataloader, args_from_dict
-from deepspeed.runtime.lr_schedules import LR_RANGE_TEST, LR_RANGE_TEST_MIN_LR, LR_RANGE_TEST_STEP_RATE, LR_RANGE_TEST_STEP_SIZE, LR_RANGE_TEST_STAIRCASE
-from deepspeed.runtime.lr_schedules import WARMUP_LR, WARMUP_MIN_LR, WARMUP_MAX_LR, WARMUP_NUM_STEPS
-from deepspeed.runtime.lr_schedules import ONE_CYCLE, CYCLE_MIN_LR, CYCLE_MAX_LR, CYCLE_FIRST_STEP_SIZE, DECAY_LR_RATE, DECAY_STEP_SIZE
-from deepspeed.runtime.lr_schedules import CYCLE_MIN_MOM, CYCLE_MAX_MOM, DECAY_MOM_RATE
-from deepspeed.runtime.lr_schedules import WARMUP_DECAY_LR, TOTAL_NUM_STEPS
+from deepspeed.runtime.lr_schedules import (
+    LR_RANGE_TEST,
+    LR_RANGE_TEST_MIN_LR,
+    LR_RANGE_TEST_STEP_RATE,
+    LR_RANGE_TEST_STEP_SIZE,
+    LR_RANGE_TEST_STAIRCASE,
+    WARMUP_LR,
+    WARMUP_MIN_LR,
+    WARMUP_MAX_LR,
+    WARMUP_NUM_STEPS,
+    ONE_CYCLE,
+    CYCLE_MIN_LR,
+    CYCLE_MAX_LR,
+    CYCLE_FIRST_STEP_SIZE,
+    DECAY_LR_RATE,
+    DECAY_STEP_SIZE,
+    CYCLE_MIN_MOM,
+    CYCLE_MAX_MOM,
+    DECAY_MOM_RATE,
+    WARMUP_DECAY_LR,
+    TOTAL_NUM_STEPS,
+)
+from .common import distributed_test
+from .simple_model import SimpleModel, random_dataloader, args_from_dict
 
 
 def _verify_continuous_decrease(values):
