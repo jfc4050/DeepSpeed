@@ -13,15 +13,14 @@ from deepspeed.runtime.pipe.topology import *
 PipeTopo = PipeDataParallelTopology
 
 from deepspeed.ops.op_builder import FusedLambBuilder, CPUAdamBuilder
-
 from deepspeed.runtime.zero.stage3 import FP16_DeepSpeedZeroOptimizer_Stage3
-from util import required_torch_version
 
 import pytest
 import os
 import numbers
 from .common import distributed_test
 from .simple_model import *
+from .util import required_torch_version
 
 
 def compare_deepspeed_states(saved_model, loaded_model):
