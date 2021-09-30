@@ -2723,16 +2723,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # warn user about caching allocator flushes
         alloc_retries = torch.cuda.memory_stats()["num_alloc_retries"]
         if alloc_retries > self.__n_caching_allocator_flushes:
-            self.__n_caching_allocator_flushes = alloc_retries
             if dist.get_rank() == 0:
                 logger.warning(
                     "%d pytorch allocator cache flushes. this happens "
                     "when there is high memory pressure and is highly detrimental to "
                     "performance. if this is happening frequently consider adjusting "
                     "settings to reduce memory consumption",
-                    self.__n_caching_allocator_flushes)
-
-        return
+                    alloc_retries - self.__n_caching_allocator_flushes)
+            self.__n_caching_allocator_flushes = alloc_retries
 
     def dump_pre_step_gradients(self, debug_fp32_grads):
         # Dump gradient norms for debbuging
