@@ -267,6 +267,9 @@ class InsertPostInitMethodToModuleSubClasses(object):
             so that the applied function is applied to child modules correctly.
             """
             def get_wrapped_fn_to_apply(fn_to_apply: Callable) -> Callable:
+                if hasattr(fn_to_apply, "wrapped"):
+                    return fn_to_apply
+
                 @functools.wraps(fn_to_apply)
                 def wrapped_fn_to_apply(module_to_apply_fn_to: Module) -> None:
                     """gathers parameters before calling apply function. afterwards
@@ -295,6 +298,8 @@ class InsertPostInitMethodToModuleSubClasses(object):
 
                     for param in params_to_apply_fn_to:
                         param.partition(has_been_updated=True)
+
+                wrapped_fn_to_apply.wrapped = True
 
                 return wrapped_fn_to_apply
 
