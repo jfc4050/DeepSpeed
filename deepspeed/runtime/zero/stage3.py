@@ -1559,6 +1559,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # post backward hook
         module.register_forward_pre_hook(_post_backward_module_hook)
 
+    @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}",
                          force=False)
@@ -1574,6 +1575,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
 
+    @torch.no_grad()
     def post_sub_module_forward_function(self, sub_module):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
@@ -1585,11 +1587,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
             force=False)
 
+    @torch.no_grad()
     def pre_sub_module_backward_function(self, sub_module):
         if not self.param_coordinator.trace_complete:
             self.param_coordinator.record_trace(sub_module)
         self.param_coordinator.fetch_sub_module(sub_module)
 
+    @torch.no_grad()
     def post_sub_module_backward_function(self, sub_module):
         see_memory_usage(
             f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} before release",
