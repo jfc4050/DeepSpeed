@@ -303,6 +303,7 @@ class PartitionedParameterCoordinator:
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(
             lambda: int(-1e10))
         self.__step_id = 0
+        self.__n_available_params = 0
 
     """Fetch and Release
     Fetching, prefetching, and releasing parameters
