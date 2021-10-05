@@ -414,9 +414,6 @@ class InsertPostInitMethodToModuleSubClasses(object):
         if exc_type is not None:
             return False
 
-        torch.cuda.empty_cache()
-        torch.distributed.barrier()
-
     # To be implemented by inheriting classes
     def _post_init_method(self, module):
         pass
