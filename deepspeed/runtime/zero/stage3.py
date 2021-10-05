@@ -3,13 +3,14 @@
 Licensed under the MIT license.
 """
 
+import gc
 from dataclasses import dataclass
 import functools
 import os
 import collections
 from collections import OrderedDict, UserDict
 import itertools
-from typing import Deque, Dict, Iterable, Set, Union
+from typing import Deque, Dict, Iterable, Set, Tuple
 import torch
 from torch.cuda import Event, Stream
 from torch.nn import Module, Parameter
@@ -929,6 +930,60 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage(f"After initializing ZeRO optimizer", force=False)
+
+        persistent_tensors: Set[Tensor] = set()
+        for param in self.module.parameters(recurse=True):
+            param.partition()
+            persistent_tensors.add(param.ds_tensor)
+
+        FP16_DeepSpeedZeroOptimizer_Stage3.defragment(persistent_tensors)
+
+        if dist.get_rank(group=self.dp_process_group) == 0:
+            see_memory_usage(f"After defragmenting", force=True)
+
+    @staticmethod
+    def defragment(tensors: Set[Tensor]):
+        cuda_tensors_by_device_and_dtype: Dict[tuple,
+                                               Set[Tensor]] = collections.defaultdict(
+                                                   set)
+        for tensor in filter(lambda t: t.is_cuda, tensors):
+            cuda_tensors_by_device_and_dtype[(tensor.device, tensor.dtype)].add(tensor)
+
+        cpu_buffer_and_orig_device_to_tensor_infos: Dict[
+            Tuple[Tensor,
+                  torch.device],
+            List[Tuple[Tensor,
+                       int,
+                       int]]] = collections.defaultdict(list)
+        for (orig_device, dtype), tensorset in cuda_tensors_by_device_and_dtype.items():
+            cpu_buffer = torch.empty(sum(p.numel() for p in tensorset),
+                                     dtype=dtype,
+                                     device="cpu")
+
+            offset = 0
+            for tensor in tensorset:
+                tensor_numel = tensor.numel()
+                # move the tensor from device memory to host memory
+                cpu_buffer.narrow(0, offset, tensor_numel).copy_(tensor)
+                tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+
+                # record some data so we can restore the device tensor later
+                cpu_buffer_and_orig_device_to_tensor_infos[(cpu_buffer,
+                                                            orig_device)].append(
+                                                                (tensor,
+                                                                 offset,
+                                                                 tensor_numel))
+
+                offset += tensor_numel
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # restore device tensors
+        for (cpu_buffer, orig_device), tensor_offsets in cpu_buffer_and_orig_device_to_tensor_infos.items():
+            device_buffer = cpu_buffer.to(orig_device)
+            for tensor, offset, tensor_numel in tensor_offsets:
+                tensor.data = device_buffer.narrow(0, offset, tensor_numel)
 
     def _configure_tensor_swapping(self, offload_optimizer_config, aio_config):
         nvme_swap_folder = os.path.join(
