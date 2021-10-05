@@ -254,7 +254,7 @@ class PartitionedParameterCoordinator:
         # because ideally in the future its replaced by an async allocation
         # mechanism which doesnt require any configuration by the user.
         self.__ongoing_fetch_events: Deque[Event] = collections.deque()
-        self.__max_ongoing_fetch_events: int = 5
+        self.__max_ongoing_fetch_events: int = 2
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
