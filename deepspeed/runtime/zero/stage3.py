@@ -1968,8 +1968,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self.gpu_sum.add_(partition.float().sum())
             self.__partition_grads(self.__params_in_ipg_bucket, grad_partitions)
 
-            for p in self.__params_in_ipg_bucket:
-                p.record_stream(torch.cuda.current_stream())
             self.__params_in_ipg_bucket.clear()
 
             event = Event()
