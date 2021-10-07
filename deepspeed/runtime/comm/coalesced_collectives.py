@@ -33,27 +33,32 @@ def reduce_scatter_coalesced(
     padded_partition_sz_for_each_tensor = tuple(
         math.ceil(t.numel() / world_sz) for t in tensors)
 
-    # interleave tensor partitions such that the correct reduced partitions of each tensor
-    # end up at each rank
-    tensor_partitions_lst_with_padding = []
-    for rank in range(world_sz):
-        for tensor_idx in range(len(tensors)):
-            # add tensor content
-            tensor_chunk = partition_lst_for_each_tensor[tensor_idx][rank]
-            tensor_partitions_lst_with_padding.append(tensor_chunk)
+    if len(tensors) == 1 and tensors[0].numel() % world_sz == 0:
+        # if there's only one tensor being reduced and we don't need to pad
+        # we have an opportunity to avoid a memory allocation
+        tensor_partition_flat_buffer = tensors[0].view(-1)
+    else:
+        # interleave tensor partitions such that the correct reduced partitions of each tensor
+        # end up at each rank
+        tensor_partitions_lst_with_padding = []
+        for rank in range(world_sz):
+            for tensor_idx in range(len(tensors)):
+                # add tensor content
+                tensor_chunk = partition_lst_for_each_tensor[tensor_idx][rank]
+                tensor_partitions_lst_with_padding.append(tensor_chunk)
 
-            # add padding if necessary
-            padding_sz = padded_partition_sz_for_each_tensor[
-                tensor_idx] - tensor_chunk.numel()
-            if padding_sz > 0:
-                tensor_partitions_lst_with_padding.append(
-                    torch.empty(padding_sz,
-                                dtype=tensor_chunk.dtype,
-                                device=tensor_chunk.device))
+                # add padding if necessary
+                padding_sz = padded_partition_sz_for_each_tensor[
+                    tensor_idx] - tensor_chunk.numel()
+                if padding_sz > 0:
+                    tensor_partitions_lst_with_padding.append(
+                        torch.empty(padding_sz,
+                                    dtype=tensor_chunk.dtype,
+                                    device=tensor_chunk.device))
 
-    # concatenate interleaved components into a flat buffer
-    tensor_partition_flat_buffer = instrument_w_nvtx(
-        torch.cat)(tensor_partitions_lst_with_padding)
+        tensor_partition_flat_buffer = instrument_w_nvtx(
+            torch.cat)(tensor_partitions_lst_with_padding)
+
     tensor_partition_buffer_for_each_rank: List[Tensor] = torch.chunk(
         tensor_partition_flat_buffer,
         world_sz)
