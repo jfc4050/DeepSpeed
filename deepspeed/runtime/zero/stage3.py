@@ -256,8 +256,6 @@ class PartitionedParameterCoordinator:
         self.__ongoing_fetch_events: Deque[Event] = collections.deque()
         self.__max_ongoing_fetch_events: int = 5
 
-        dist.barrier()
-
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
     and passing trace results into constructor. This way all the code in here can
@@ -1865,23 +1863,18 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     @instrument_w_nvtx
     @torch.no_grad()
     def __add_grad_to_ipg_bucket(self, param: Parameter) -> None:
-        if self.contiguous_gradients and (param.ds_numel > self.reduce_bucket_size):
-            raise NotImplementedError(
-                f"param ds_numel {param.ds_numel} too large for fixed buffer of size {self.reduce_bucket_size}. "
-                f"in the future it is possible to just dynamically allocate and reduce but for now "
-                f"please increase size of reduce bucket")
-
         self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
 
-        if self.contiguous_gradients:
+        if self.contiguous_gradients and self.elements_in_ipg_bucket + param.grad.numel(
+        ) < self.reduce_bucket_size:
             # move the gradient to a contiguous buffer
             with torch.cuda.stream(self.__reduce_and_partition_stream):
                 # move the parameter's gradient to the contiguous flat buffer
                 new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
                     0,
                     self.elements_in_ipg_bucket,
-                    param.ds_numel).view_as(param.grad)
-                new_grad_tensor.copy_(param.grad)
+                    param.grad.numel()).view_as(param.grad)
+                new_grad_tensor.copy_(param.grad, non_blocking=True)
                 param.grad.record_stream(torch.cuda.current_stream())
                 param.grad.data = new_grad_tensor
 
