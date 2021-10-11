@@ -410,6 +410,10 @@ class InsertPostInitMethodToModuleSubClasses(object):
         #        if self.mem_efficient_linear:
         #            torch.nn.functional.linear = self.linear_bk
 
+        if torch.distributed.get_rank() == 0:
+            logger.info("finished initializing model with %.2fB parameters",
+                        param_count / 1e9)
+
         # Now that we cleaned up the metaclass injection, raise the exception.
         if exc_type is not None:
             return False
