@@ -282,6 +282,16 @@ class InsertPostInitMethodToModuleSubClasses(object):
                     3. broadcasts root rank's parameters to the other ranks
                     4. re-partitions the parameters
                     """
+                    if not all(
+                            is_zero_param(p)
+                            for p in module_to_apply_fn_to.parameters(recurse=False)):
+                        raise RuntimeError(
+                            f"not all parameters for {module_to_apply_fn_to.__class__.__name__}, "
+                            f"were zero params, is it possible that the parameters were "
+                            f"overwritten after they were initialized? "
+                            f"params: {[p for p in module_to_apply_fn_to.parameters(recurse=False)]} "
+                        )
+
                     params_to_apply_fn_to: Iterable[Parameter] = list(
                         sorted(module_to_apply_fn_to.parameters(recurse=False),
                                key=lambda p: p.ds_id))
