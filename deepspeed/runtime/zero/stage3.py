@@ -194,9 +194,7 @@ class PartitionedParameterCoordinator:
     """Handles partitioning and gathering of parameters."""
     class __InflightParamRegistry(UserDict):
         """registry for parameters in flight"""
-        def __setitem__(self,
-                        param: Parameter,
-                        handle: AllGatherCoalescedHandle) -> None:
+        def __setitem__(self, param: Parameter, handle: AllGatherHandle) -> None:
             if param in self.data:
                 raise RuntimeError(f"{param.ds_summary()} already in registry")
             if param.ds_status != ZeroParamStatus.INFLIGHT:
@@ -255,7 +253,7 @@ class PartitionedParameterCoordinator:
         # because ideally in the future its replaced by an async allocation
         # mechanism which doesnt require any configuration by the user.
         self.__ongoing_fetch_events: Deque[Event] = collections.deque()
-        self.__max_ongoing_fetch_events: int = 2
+        self.__max_ongoing_fetch_events: int = 4
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator

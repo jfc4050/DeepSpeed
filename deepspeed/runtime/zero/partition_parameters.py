@@ -475,65 +475,14 @@ class InsertPostInitMethodToModuleSubClasses(object):
 
 
 class AllGatherHandle:
-    def __init__(self, handle, param: Parameter) -> None:
+    def __init__(self, handle, params: List[Parameter]) -> None:
         self.__handle = handle
-        self.__param = param
+        self.__params = params
 
     def wait(self) -> None:
         instrument_w_nvtx(self.__handle.wait)()
-        self.__param.ds_status = ZeroParamStatus.AVAILABLE
-
-
-class AllGatherCoalescedHandle:
-    def __init__(
-            self,
-            allgather_handle,
-            params: List[Parameter],
-            partitions: List[Tensor],
-            world_size: int,
-    ) -> None:
-        self.__allgather_handle = allgather_handle
-        self.__params = params
-        self.__partitions = partitions
-        self.__world_size = world_size
-        self.__complete = False
-
         for param in self.__params:
-            if param.ds_status != ZeroParamStatus.INFLIGHT:
-                raise RuntimeError(
-                    f"expected param {param.ds_summary()} to not be available")
-
-    @instrument_w_nvtx
-    def wait(self) -> None:
-        if self.__complete:
-            return
-
-        instrument_w_nvtx(self.__allgather_handle.wait)()
-
-        # split the single tensor out into individual tensors
-        param_offset = 0
-        for param in self.__params:
-            assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
-            partitions: List[Tensor] = []
-            for rank in range(self.__world_size):
-                param_start = rank * param.ds_tensor.ds_numel
-                if param_start < param.ds_numel:
-                    part_to_copy = self.__partitions[rank].narrow(
-                        0,
-                        param_offset,
-                        min(param.ds_numel - param_start,
-                            param.ds_tensor.ds_numel))
-                    partitions.append(part_to_copy)
-
-            param.data = instrument_w_nvtx(torch.cat)(partitions).view(param.ds_shape)
             param.ds_status = ZeroParamStatus.AVAILABLE
-
-            for part_to_copy in partitions:
-                part_to_copy.record_stream(torch.cuda.current_stream())
-
-            param_offset += param.ds_tensor.ds_numel
-
-        self.__complete = True
 
 
 # Replaces all parameters in module with Scattered Parameters
@@ -787,7 +736,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         @instrument_w_nvtx
         def all_gather_coalesced(params: Iterable[Parameter],
-                                 safe_mode: bool = False) -> AllGatherCoalescedHandle:
+                                 safe_mode: bool = False) -> AllGatherHandle:
 
             # fetches from nvme if the partition is not available and in nvme
             self._ensure_availability_of_partitioned_params(params)
@@ -816,51 +765,30 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 # otherwise could mix data between tensors.
                 assert_ints_same_as_other_ranks([p.ds_tensor.ds_numel for p in params])
 
-            if len(params) == 1:
-                # have an opportunity to avoid some intermediate memory allocations
-                param, = params
+            output_tensors = []
+            input_tensors = []
+            for param in params:
                 param_buffer = torch.empty(
                     math.ceil(param.ds_numel / self.world_size) * self.world_size,
                     dtype=param.dtype,
                     device=param.device,
                     requires_grad=False,
                 )
-                handle = torch_allgather_fn(
-                    param.ds_tensor,
-                    param_buffer,
-                    self.ds_process_group,
-                )
                 param.data = param_buffer.narrow(0,
                                                  0,
                                                  param.ds_numel).view(param.ds_shape)
-                return AllGatherHandle(handle, param)
-            else:
-                partition_sz = sum(p.ds_tensor.ds_numel for p in params)
-                flat_tensor = torch.empty(partition_sz * self.world_size,
-                                          dtype=get_only_unique_item(p.dtype
-                                                                     for p in params),
-                                          device=self.local_device,
-                                          requires_grad=False)
-                partitions: List[Parameter] = []
-                for i in range(self.world_size):
-                    partitions.append(
-                        flat_tensor.narrow(0,
-                                           partition_sz * i,
-                                           partition_sz))
 
-                instrument_w_nvtx(torch.cat)([p.ds_tensor.data for p in params],
-                                             out=partitions[self.rank])
+                output_tensors.append(param_buffer)
+                input_tensors.append(param.ds_tensor.data.view(-1))
 
-                handle = torch_allgather_fn(partitions[self.rank],
-                                            flat_tensor,
-                                            self.ds_process_group)
+            handle = torch.distributed.distributed_c10d._all_gather_base_coalesced(
+                output_tensors,
+                input_tensors,
+                group=self.ds_process_group,
+                async_op=True,
+            )
 
-                return AllGatherCoalescedHandle(
-                    allgather_handle=handle,
-                    params=params,
-                    partitions=partitions,
-                    world_size=self.world_size,
-                )
+            return AllGatherHandle(handle, params)
 
         def partition(param_list=None, hierarchy=0, has_been_updated=False):
             cls = param
