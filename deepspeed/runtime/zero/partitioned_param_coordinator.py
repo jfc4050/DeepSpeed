@@ -181,7 +181,7 @@ class PartitionedParameterCoordinator:
         """indicate that we have completed one fwd+bwd for the model"""
         if self.__inflight_param_registry:
             raise RuntimeError(f"still have inflight params "
-                               f"{[p.ds_summary for p in self.__inflight_param_registry.keys()]}")
+                               f"{[debug_param2name_id(p) for p in self.__inflight_param_registry.keys()]}")
 
         if not self.is_complete_trace():  # not self.trace_complete:
             # Make sure that recorded submodule orders are identical across ranks
